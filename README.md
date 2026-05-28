@@ -1,57 +1,68 @@
-# Марк1 — Parser конкурентов косметологии
+# Марк1 — Парсер конкурентов косметологии
 
-Автоматический сбор и анализ конкурентов (клиники косметологии) для **НОМОС КЛИНИК**.
+Полностью самодостаточный сервис для сбора и анализа конкурентов-клиник косметологии в Москве.
 
-## Архитектура
+## Возможности
 
-```
-n8n (Schedule Trigger)
-  │
-  ▼ POST /competitors/search
-apify-parser ──▶ YouTube API ──▶ Google Sheets
-  │                                    │
-  ▼ POST /competitors/analyze          │
-apify-parser ──▶ AI (OpenRouter) ──────┘
-                заполняет: ToV, угроза,
-                выводы, рекомендации
-```
+- **Brave Search API** — поиск клиник по ключевым запросам (сайты, отзывы)
+- **YouTube Data API** — поиск каналов клиник/косметологов
+- **Apify Instagram Scraper** — поиск Instagram-профилей
+- **Google Sheets** — запись результатов (опционально)
+- **HTTP-сервер** — для n8n или внешних вызовов
+- **Docker** — изолированный контейнер
 
-## Компоненты
+## Быстрый старт
 
-| Файл | Назначение |
-|---|---|
-| `search_competitors.py` | Поиск клиник через YouTube API + Apify Instagram |
-| `analyze_competitors.py` | AI-анализ через OpenRouter (Gemini 2.0 Flash) |
-| `http_server.py` | HTTP-сервер :8888 для n8n |
-| `sheets.py` | Google Sheets клиент (сервисный аккаунт) |
-| `n8n_workflow_daily.json` | Workflow для n8n (ежедневный запуск) |
+```bash
+# 1. Скопировать .env
+cp .env.example .env
+# Заполнить ключи (хотя бы BRAVE_API_KEY)
 
-## Переменные окружения (.env)
+# 2. Запустить поиск
+docker compose run --rm mark1 python3 /app/search_competitors.py
 
-```
-# YouTube API
-YOUTUBE_API_KEY=your_youtube_api_key
-
-# Apify
-APIFY_API_TOKEN=your_apify_token
-APIFY_API_TOKEN_BACKUP=backup_token
-
-# AI / OpenRouter
-OPENROUTER_API_KEY=your_openrouter_key
-
-# Google Sheets (сервисный аккаунт)
-GOOGLE_APPLICATION_CREDENTIALS=path_to_service_account.json
+# 3. Или HTTP-сервер для n8n
+docker compose up -d
 ```
 
-## Запуск
+## Переменные окружения
+
+| Переменная | Для чего | Обязательно |
+|---|---|---|
+| `BRAVE_API_KEY` | Brave Search (2000 запросов/мес, бесплатно) | Да (если без него — только YouTube) |
+| `YOUTUBE_API_KEY` | YouTube Data API | Нет |
+| `APIFY_API_TOKEN` | Instagram через Apify | Нет |
+| `OPENROUTER_API_KEY` | AI-анализ (ToV, выводы) | Нет |
+| `GOOGLE_CREDENTIALS_JSON` | Google Sheets (JSON сервисного аккаунта) | Нет |
+| `SHEET_ID` | ID таблицы для записи | Нет (без неё — dry-run) |
+
+## Команды
 
 ```bash
 # Поиск конкурентов
-python3 search_competitors.py
+docker compose run --rm mark1 python3 /app/search_competitors.py
 
-# AI-анализ
-python3 analyze_competitors.py
+# AI-анализ (дозаполняет творческие поля)
+docker compose run --rm mark1 python3 /app/analyze_competitors.py
 
-# HTTP-сервер для n8n
-python3 http_server.py 8888
+# HTTP-сервер (порт 8888)
+docker compose up -d
+# POST /competitors/search
+# POST /competitors/analyze
+# GET  /competitors/status
+# GET  /health
 ```
+
+## API эндпоинты (HTTP-сервер)
+
+```bash
+curl -X POST http://localhost:8888/competitors/search
+# → {"success": true, "total": 15, "report": "..."}
+
+curl -X POST http://localhost:8888/competitors/analyze
+# → {"success": true, "total": 10, "report": "..."}
+```
+
+## Лицензия
+
+MIT
