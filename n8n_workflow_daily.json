@@ -1,0 +1,65 @@
+{
+  "name": "Mark1 — Daily Competitor Search",
+  "active": false,
+  "nodes": [
+    {
+      "id": "schedule-trigger",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "parameters": {
+        "rule": {
+          "interval": [{"field": "hours", "hoursInterval": 24}]
+        }
+      }
+    },
+    {
+      "id": "search-competitors",
+      "name": "Search Competitors",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [500, 300],
+      "parameters": {
+        "url": "http://172.19.0.2:8888/competitors/search",
+        "options": {},
+        "sendBody": true,
+        "method": "POST",
+        "authentication": "none"
+      }
+    },
+    {
+      "id": "analyze-competitors",
+      "name": "AI Analysis",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [750, 300],
+      "parameters": {
+        "url": "http://172.19.0.2:8888/competitors/analyze",
+        "options": {},
+        "sendBody": true,
+        "method": "POST",
+        "authentication": "none"
+      }
+    },
+    {
+      "id": "no-op",
+      "name": "NoOp",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1000, 400],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [[{"node": "Search Competitors", "type": "main", "index": 0}]]
+    },
+    "Search Competitors": {
+      "main": [[{"node": "AI Analysis", "type": "main", "index": 0}]]
+    },
+    "AI Analysis": {
+      "main": [[{"node": "NoOp", "type": "main", "index": 0}]]
+    }
+  }
+}
