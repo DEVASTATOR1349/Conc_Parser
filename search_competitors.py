@@ -1,24 +1,38 @@
 #!/usr/bin/env python3
 """
 v2: Поиск конкурентов для НОМОС КЛИНИК.
-Использует YouTube API, Apify Instagram.
+Использует YouTube API, Apify Instagram, Brave Search API.
 
-Запуск: python3 /app/gen_compet_search.py
+Запуск: python3 search_competitors.py
 Авто:   через crontab в apify-parser или n8n
+
+Переменные окружения (.env):
+  YOUTUBE_API_KEY=
+  APIFY_API_TOKEN=
+  BRAVE_API_KEY=
 """
 
-import json, os, re, sys, time
+import html, json, os, re, sys, time
 from datetime import datetime
+from urllib.parse import urlparse
 
 import requests
-sys.path.insert(0, "/app/src")
-from sheets import _get_service as get_sheets_service
+
+# Google Sheets клиент (опционально, если запуск не из apify-parser)
+try:
+    sys.path.insert(0, "/app/src")
+    from sheets import _get_service as get_sheets_service
+except ImportError:
+    get_sheets_service = None
 
 YT_KEY = os.getenv("YOUTUBE_API_KEY", "")
 APIFY_TOKEN = os.getenv("APIFY_API_TOKEN", "")
+BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
 
 COMPETITORS_SHEET_ID = "1zVNwBX7e8FIZ-0bP7qU2UTbueXrukoev0NbSCS9EwHQ"
 REPORT_TAB = "Отчёт по конкурентам"
+
+# ── Фильтры ──
 
 BAD_KEYWORDS = [
     "песня", "музыка", "игра", "фильм", "кино", "сериал",
@@ -34,6 +48,19 @@ BAD_KEYWORDS = [
     "lifestyle блог", "shopping", "макияж уроки",
     "оратор", "успех", "бизнес молодость",
 ]
+
+RELEVANT_WORDS = [
+    "клиник", "косметолог", "дерматолог", "трихолог",
+    "пластический", "эстетический", "медицин",
+    "лазерн", "инъекци", "ботокс", "филлер",
+    "омоложен", "лифтинг", "нитив", "пилинг",
+    "биоревитализаци", "акне",
+    "пересадк", "волос", "хирург",
+    "доктор", "dr.", "врач",
+    "москв", "moscow",
+]
+
+# ── Поисковые запросы ──
 
 YT_SEARCH_QUERIES = [
     "косметология Москва клиника",
@@ -51,13 +78,30 @@ YT_SEARCH_QUERIES = [
     "косметолог москва отзывы",
 ]
 
+BRAVE_SEARCH_QUERIES = [
+    "косметология Москва клиника сайт",
+    "пластическая хирургия Москва клиника",
+    "лазерная эпиляция Москва клиника отзывы",
+    "инъекционная косметология Москва цены",
+    "аппаратная косметология Москва центр",
+    "трихология Москва центр лечения волос",
+    "омоложение лица Москва клиника",
+    "нити лицо Москва косметолог",
+    "ботокс филлеры Москва клиника",
+    "эстетическая медицина Москва рейтинг",
+]
+
+# ── Вспомогательные функции ──
+
 
 def get_sheets():
-    return get_sheets_service()
+    if get_sheets_service:
+        return get_sheets_service()
+    return None
 
 
 def get_existing(service):
-    """Возвращаем (ссылки, названия)."""
+    """Возвращаем (ссылки, названия) из таблицы — чтобы не дублировать."""
     try:
         result = service.spreadsheets().values().get(
             spreadsheetId=COMPETITORS_SHEET_ID,
@@ -85,39 +129,7 @@ def is_relevant(title, desc):
     for kw in BAD_KEYWORDS:
         if kw.lower() in text:
             return False
-    relevant = [
-        "клиник", "косметолог", "дерматолог", "трихолог",
-        "пластический", "эстетический", "медицин",
-        "лазерн", "инъекци", "ботокс", "филлер",
-        "омоложен", "лифтинг", "нитив", "пилинг",
-        "биоревитализаци", "акне",
-        "пересадк", "волос", "хирург",
-        "доктор", "dr.", "врач",
-        "москв", "moscow",
-    ]
-    return any(w in text for w in relevant)
-
-
-def get_yt_stats(channel_id):
-    if not YT_KEY:
-        return {}
-    try:
-        url = (f"https://youtube.googleapis.com/youtube/v3/channels"
-               f"?part=statistics,snippet"
-               f"&id={channel_id}"
-               f"&key={YT_KEY}")
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            items = resp.json().get("items", [])
-            if items:
-                s = items[0].get("statistics", {})
-                return {
-                    "subs": int(s.get("subscriberCount", 0)),
-                    "videos": int(s.get("videoCount", 0)),
-                }
-    except:
-        pass
-    return {}
+    return any(w in text for w in RELEVANT_WORDS)
 
 
 def fmt_subs(n):
@@ -126,6 +138,105 @@ def fmt_subs(n):
     elif n >= 1_000:
         return f"{n//1000}K"
     return str(n)
+
+
+def dedup(items, key="name"):
+    seen = {}
+    for item in items:
+        k = item[key].lower()
+        if k not in seen:
+            seen[k] = item
+    return list(seen.values())
+
+
+# ── Источники поиска ──
+
+
+def search_brave(existing_links, existing_names):
+    """Поиск через Brave Search API (бесплатно: 2000 запросов/мес)."""
+    if not BRAVE_API_KEY:
+        print("  НЕТ BRAVE_API_KEY")
+        return []
+
+    found = []
+    for query in BRAVE_SEARCH_QUERIES:
+        print(f"  Brave: {query}", end="", flush=True)
+        try:
+            url = (f"https://api.search.brave.com/res/v1/web/search"
+                   f"?q={requests.utils.quote(query)}"
+                   f"&count=10"
+                   f"&country=RU"
+                   f"&search_lang=ru")
+            headers = {
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+                "X-Subscription-Token": BRAVE_API_KEY,
+            }
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                print(f" -> {resp.status_code}")
+                time.sleep(0.5)
+                continue
+
+            data = resp.json()
+            results = []
+            for group in ("web", "news"):
+                for item in data.get(group, {}).get("results", []):
+                    results.append(item)
+
+            n = 0
+            for item in results:
+                title = html.unescape(item.get("title", "").strip())
+                desc = html.unescape(
+                    item.get("description", "")
+                    or item.get("snippet", "")
+                ).strip()
+                link = item.get("url", "")
+
+                if not title or not is_relevant(title, desc):
+                    continue
+                if title.lower() in existing_names:
+                    continue
+                if link.lower().rstrip("/") in existing_links:
+                    continue
+
+                domain = urlparse(link).netloc.lower()
+                cat = "Прямой — клиника/косметолог"
+                if "instagram" in domain:
+                    cat = "Прямой — косметолог/блогер"
+                elif any(d in domain for d in ("prodoctorov", "otzyv", "napopravku")):
+                    cat = "Отзовик — профиль клиники"
+
+                found.append({
+                    "name": title,
+                    "category": cat,
+                    "links": link,
+                    "subscribers": "—",
+                    "positioning": desc[:300] if desc else "Клиника косметологии",
+                    "services": "Косметологические услуги",
+                    "price_segment": "—",
+                    "strengths": f"Brave Search. {desc[:250]}".strip()[:300],
+                    "weaknesses": "—",
+                    "tov": "—",
+                    "audience": "Женщины 25–50",
+                    "activity": "—",
+                    "formats": "—",
+                    "threat_level": "—",
+                    "borrow": "—",
+                    "conclusion": f"Найден Brave Search: {query}",
+                    "source": "brave",
+                })
+
+                existing_links.add(link.lower().rstrip("/"))
+                existing_names.add(title.lower())
+                n += 1
+
+            print(f" +{n}")
+            time.sleep(0.3)
+        except Exception as e:
+            print(f" ERR: {e}")
+
+    return dedup(found)
 
 
 def search_youtube(service, existing_links, existing_names):
@@ -166,10 +277,26 @@ def search_youtube(service, existing_links, existing_names):
                 if c_url.lower() in existing_links:
                     continue
 
-                stats = get_yt_stats(cid)
+                # Статистика канала
+                stats = {}
+                if YT_KEY:
+                    try:
+                        surl = (f"https://youtube.googleapis.com/youtube/v3/channels"
+                                f"?part=statistics&id={cid}&key={YT_KEY}")
+                        sr = requests.get(surl, timeout=10)
+                        if sr.status_code == 200:
+                            si = sr.json().get("items", [])
+                            if si:
+                                st = si[0].get("statistics", {})
+                                stats = {
+                                    "subs": int(st.get("subscriberCount", 0)),
+                                    "videos": int(st.get("videoCount", 0)),
+                                }
+                    except Exception:
+                        pass
+
                 ss = fmt_subs(stats.get("subs", 0)) if stats else "?"
                 vc = stats.get("videos", 0) if stats else 0
-
                 act = f"~{vc} видео" if vc else "—"
                 strong = f"YouTube-канал"
                 if ss != "?":
@@ -205,13 +332,7 @@ def search_youtube(service, existing_links, existing_names):
         except Exception as e:
             print(f" ERR: {e}")
 
-    # Дед-ап по названиям
-    seen = {}
-    for item in found:
-        k = item["name"].lower()
-        if k not in seen:
-            seen[k] = item
-    return list(seen.values())
+    return dedup(found)
 
 
 def search_instagram_apify(existing_names):
@@ -223,10 +344,7 @@ def search_instagram_apify(existing_names):
     from apify_client import ApifyClient
     client = ApifyClient(token=APIFY_TOKEN)
 
-    queries = [
-        "косметология Москва",
-        "пластический хирург Москва",
-    ]
+    queries = ["косметология Москва", "пластический хирург Москва"]
 
     found = []
     for query in queries:
@@ -252,9 +370,7 @@ def search_instagram_apify(existing_names):
                 bio = item.get("biography", "") or ""
                 is_biz = item.get("isBusinessAccount", False)
 
-                if followers < 100:
-                    continue
-                if not is_biz:
+                if followers < 100 or not is_biz:
                     continue
                 if full_name.lower() in existing_names:
                     continue
@@ -264,17 +380,16 @@ def search_instagram_apify(existing_names):
                 url = f"https://www.instagram.com/{username}/"
                 ss = fmt_subs(followers)
                 act = f"~{posts} постов" if posts else "—"
-                strong = f"Instagram-блогер, {ss} подписчиков. {bio[:200]}"
 
                 found.append({
                     "name": f"{full_name} (@{username})",
                     "category": "Прямой — косметолог/блогер",
                     "links": url,
                     "subscribers": f"{ss} (IG)",
-                    "positioning": bio[:250] if bio else "Instagram-блогер в косметологии",
+                    "positioning": bio[:250] if bio else "Instagram-блогер",
                     "services": "Косметология",
                     "price_segment": "—",
-                    "strengths": strong.strip()[:300],
+                    "strengths": f"Instagram-блогер, {ss} подписчиков. {bio[:200]}".strip()[:300],
                     "weaknesses": "—",
                     "tov": "—",
                     "audience": "Женщины 20–45",
@@ -282,16 +397,19 @@ def search_instagram_apify(existing_names):
                     "formats": "Instagram (Reels, Stories)",
                     "threat_level": "—",
                     "borrow": "—",
-                    "conclusion": "Найден через Apify Instagram Search.",
+                    "conclusion": "Найден через Apify Instagram.",
                     "source": "instagram",
                 })
                 existing_names.add(full_name.lower())
 
-            print(f"    Найдено новых: {len(found)}")
+            print(f"    Найдено: {len(found)}")
         except Exception as e:
             print(f"    ERR: {e}")
 
-    return found
+    return dedup(found)
+
+
+# ── Запись в Google Sheets ──
 
 
 def write_results(service, rows):
@@ -328,44 +446,55 @@ def write_results(service, rows):
             total += len(batch)
             print(f"  Записано: {len(batch)} (всего {total})")
         except Exception as e:
-            print(f"  Ошибка: {e}")
+            print(f"  Ошибка записи: {e}")
             break
         time.sleep(0.3)
     return total
 
 
+# ── Main ──
+
+
 def main():
     print("=" * 60)
-    print(f"ПОИСК КОНКУРЕНТОВ v2.0")
+    print(f"ПОИСК КОНКУРЕНТОВ v2 + Brave Search")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("=" * 60)
 
     service = get_sheets()
     if not service:
-        return
+        print("⚠️ Без Google Sheets (режим dry-run, найденные не сохраним)")
 
-    print("\n1. Существующие записи...")
-    el, en = get_existing(service)
-    print(f"   Ссылок: {len(el)}, Названий: {len(en)}")
+    el, en = set(), set()
+    if service:
+        print("\n1. Существующие записи...")
+        el, en = get_existing(service)
+        print(f"   Ссылок: {len(el)}, Названий: {len(en)}")
 
-    print("\n2. YouTube API...")
-    yt = search_youtube(service, el, en)
+    print("\n2. Brave Search...")
+    br = search_brave(el, en)
 
-    print("\n3. Instagram (Apify)...")
+    print("\n3. YouTube API...")
+    yt = search_youtube(service, el, en) if service else search_brave(el, en)
+
+    print("\n4. Instagram (Apify)...")
     ig = search_instagram_apify(en)
 
-    all_new = yt + ig
-    print(f"\nИТОГО: {len(yt)} YT + {len(ig)} IG = {len(all_new)}")
+    all_new = br + yt + ig
+    print(f"\nИТОГО: {len(br)} Brave + {len(yt)} YT + {len(ig)} IG = {len(all_new)}")
 
-    if all_new:
+    if all_new and service:
         written = write_results(service, all_new)
         print(f"\nЗаписано: {written}")
+    elif all_new:
+        print(f"\n(dry-run) Найдено: {len(all_new)}, не записано (нет Sheets)")
+
+    if all_new:
         print("\nТоп:")
         for item in all_new[:10]:
             s = item.get("subscribers", "")
-            print(f"  {item['name'][:40]:40s} | {s:12s} | {item['links'][:40]}")
-    else:
-        print("\nНовых нет")
+            src = item.get("source", "")
+            print(f"  [{src}] {item['name'][:36]:36s} | {s:12s} | {item['links'][:40]}")
 
     print("=" * 60)
 
