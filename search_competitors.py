@@ -8,6 +8,11 @@ search_competitors.py — Поиск конкурентов косметолог
   - YouTube Data API v3
   - Apify Instagram Profile Scraper
 
+Факт-чекинг (3 уровня):
+  L1 — быстрые маркеры (бизнес-сигналы / стоп-слова)
+  L2 — HEAD-запросы к страницам сайта
+  L3 — AI-верификация через OpenRouter (только для uncertain)
+
 Результаты:
   - Вывод в консоль
   - Google Sheets (если настроен сервисный аккаунт)
@@ -27,14 +32,20 @@ from urllib.parse import urlparse
 
 import requests
 
-# ── Подключаем свой sheets (рядом в src/) ──
+# ── Подключаем свои модули (рядом в src/) ──
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 from sheets import get_existing, write_results
+from fact_check import verify_competitor
 
 # ── Конфигурация из .env / переменных окружения ──
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
 YT_KEY = os.getenv("YOUTUBE_API_KEY", "")
 APIFY_TOKEN = os.getenv("APIFY_API_TOKEN", "")
+
+# Факт-чекинг
+FACT_CHECK_LEVEL2 = os.getenv("FACT_CHECK_LEVEL2", "true").lower() == "true"
+FACT_CHECK_LEVEL3 = os.getenv("FACT_CHECK_LEVEL3", "false").lower() == "true"
+FACT_CHECK_STRICT = os.getenv("FACT_CHECK_STRICT", "true").lower() == "true"
 
 # Таблица конкурентов (НОМОС КЛИНИК)
 SHEET_ID = os.getenv("SHEET_ID", "1zVNwBX7e8FIZ-0bP7qU2UTbueXrukoev0NbSCS9EwHQ")
@@ -139,6 +150,34 @@ def dedup(items, key="name"):
     return list(seen.values())
 
 
+def filter_with_factcheck(items):
+    """
+    Прогнать список найденных через факт-чекинг.
+    Возвращает (прошедшие, отсеянные, неопределённые).
+    """
+    passed = []
+    failed = []
+
+    for item in items:
+        verdict, reason = verify_competitor(
+            title=item.get("name", ""),
+            desc=item.get("positioning", "") + " " + item.get("strengths", ""),
+            url=item.get("links", ""),
+            use_level2=FACT_CHECK_LEVEL2,
+            use_level3=FACT_CHECK_LEVEL3,
+            verbose=False,
+        )
+
+        if verdict == "pass":
+            passed.append(item)
+        elif verdict == "uncertain" and not FACT_CHECK_STRICT:
+            passed.append(item)
+        else:
+            failed.append(item)
+
+    return passed, failed
+
+
 # ═══════════════════════════════════════════════════
 #  ИСТОЧНИКИ
 # ═══════════════════════════════════════════════════
@@ -218,6 +257,15 @@ def from_brave(existing_links, existing_names):
             time.sleep(0.3)
         except Exception as e:
             print(f" ERR: {e}")
+
+    # Факт-чекинг
+    if FACT_CHECK_LEVEL2 or FACT_CHECK_LEVEL3:
+        before = len(found)
+        found, failed = filter_with_factcheck(found)
+        if failed:
+            print(f"  [fact-check] отсеяно {len(failed)}/{before}: {', '.join(i['name'][:30] for i in failed[:5])}")
+    else:
+        found = dedup(found)
 
     return dedup(found)
 
@@ -319,6 +367,15 @@ def from_youtube(existing_links, existing_names):
         except Exception as e:
             print(f" ERR: {e}")
 
+    # Факт-чекинг
+    if FACT_CHECK_LEVEL2 or FACT_CHECK_LEVEL3:
+        before = len(found)
+        found, failed = filter_with_factcheck(found)
+        if failed:
+            print(f"  [fact-check] отсеяно {len(failed)}/{before}")
+    else:
+        found = dedup(found)
+
     return dedup(found)
 
 
@@ -407,6 +464,7 @@ def main():
     print("=" * 60)
     print(f"  ПОИСК КОНКУРЕНТОВ")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"  fact-check L2={FACT_CHECK_LEVEL2} L3={FACT_CHECK_LEVEL3} strict={FACT_CHECK_STRICT}")
     print("=" * 60)
 
     # 1. Читаем существующие записи (если есть Sheets)
