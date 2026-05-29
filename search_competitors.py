@@ -153,7 +153,8 @@ def dedup(items, key="name"):
 def filter_with_factcheck(items):
     """
     Прогнать список найденных через факт-чекинг.
-    Возвращает (прошедшие, отсеянные, неопределённые).
+    Добавляет поле fact_check в каждый item.
+    Возвращает (прошедшие, отсеянные).
     """
     passed = []
     failed = []
@@ -167,6 +168,9 @@ def filter_with_factcheck(items):
             use_level3=FACT_CHECK_LEVEL3,
             verbose=False,
         )
+
+        # Сохраняем вердикт факт-чекинга
+        item["fact_check"] = f"{verdict.upper()} — {reason}"
 
         if verdict == "pass":
             passed.append(item)
@@ -498,7 +502,11 @@ def main():
     print(f"  ИТОГО: {len(brave_res)} Brave + {len(yt_res)} YT + {len(ig_res)} IG = {len(all_new)}")
     print(f"{'=' * 60}")
 
-    # 6. Запись в Google Sheets
+    # Дефолт для fact_check (если факт-чекинг не применялся)
+    for item in all_new:
+        item.setdefault("fact_check", "—")
+
+    # 6. Запись в Google Sheets — одним батчем
     if all_new and SHEET_ID:
         print("\n5. Запись в Google Sheets...")
         written = write_results(SHEET_ID, SHEET_TAB, all_new)

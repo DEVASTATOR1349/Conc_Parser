@@ -66,7 +66,7 @@ def get_existing(spreadsheet_id: str, tab: str) -> tuple[set, set]:
 
 
 def write_results(spreadsheet_id: str, tab: str, rows: list[dict]) -> int:
-    """Записать строки в таблицу."""
+    """Записать строки в таблицу одним батчем (один API-вызов)."""
     if not rows:
         return 0
 
@@ -80,36 +80,30 @@ def write_results(spreadsheet_id: str, tab: str, rows: list[dict]) -> int:
         "positioning": 4, "services": 5, "price_segment": 6,
         "strengths": 7, "weaknesses": 8, "tov": 9, "audience": 10,
         "activity": 11, "formats": 12, "threat_level": 13,
-        "borrow": 14, "conclusion": 15,
+        "borrow": 14, "conclusion": 15, "fact_check": 16,
     }
 
     values = []
     for row in rows:
-        vals = [""] * 16
+        vals = [""] * 17  # A–Q
         for key, col in fmap.items():
             if key in row:
                 vals[col] = str(row[key])
         values.append(vals)
 
-    total = 0
-    import time
-    for i in range(0, len(values), 10):
-        batch = values[i:i + 10]
-        try:
-            service.spreadsheets().values().append(
-                spreadsheetId=spreadsheet_id,
-                range=f"{tab}!A:P",
-                valueInputOption="USER_ENTERED",
-                insertDataOption="INSERT_ROWS",
-                body={"values": batch}
-            ).execute()
-            total += len(batch)
-            print(f"  [sheets] Записано: {len(batch)} (всего {total})")
-        except Exception as e:
-            print(f"  [sheets] Ошибка записи: {e}")
-            break
-        time.sleep(0.3)
-    return total
+    try:
+        service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab}!A:Q",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": values}
+        ).execute()
+        print(f"  [sheets] Записано: {len(values)} (одним батчем)")
+        return len(values)
+    except Exception as e:
+        print(f"  [sheets] Ошибка записи: {e}")
+        return 0
 
 
 def update_cells(spreadsheet_id: str, tab: str, row_index: int, updates: dict) -> bool:
