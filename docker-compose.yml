@@ -3,7 +3,6 @@
 # Никаких зависимостей от apify-parser или других контейнеров
 # ======================================================
 
-version: "3.8"
 
 services:
   mark1:
@@ -11,7 +10,7 @@ services:
     container_name: mark1-parser
     restart: unless-stopped
     ports:
-      - "8888:8888"
+      - "18888:8888"
     env_file:
       - .env
     environment:
