@@ -3,3 +3,7 @@ google-api-python-client>=2.108.0
 google-auth>=2.27.0
 google-auth-oauthlib>=1.2.0
 apify-client>=1.4.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+aiofiles>=23.2.0

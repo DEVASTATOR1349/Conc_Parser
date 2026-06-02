@@ -1,303 +1,357 @@
 #!/usr/bin/env python3
 """
-search_competitors.py — Поиск конкурентов косметологии в Москве.
-Полностью самодостаточный модуль.
+search_competitors.py — Мульти-клиентский поиск конкурентов.
 
-Источники (опционально, по наличию ключей):
-  - Brave Search API (brave.com/search/api)
-  - YouTube Data API v3
-  - Apify Instagram Profile Scraper
+Приоритет: СОЦСЕТИ > САЙТЫ
+  1. Instagram (Apify)
+  2. TikTok (Apify)
+  3. YouTube Data API v3
+  4. VK API
+  5. Brave Search (сайты — второй план)
 
-Факт-чекинг (3 уровня):
-  L1 — быстрые маркеры (бизнес-сигналы / стоп-слова)
-  L2 — HEAD-запросы к страницам сайта
-  L3 — AI-верификация через OpenRouter (только для uncertain)
+Колонки (18):
+  A: Конкурент (название)     B: Категория     C: Ссылки (сайт/соцсети)
+  D: Подписчики (всего)       E: Позиционирование/УТП  F: Услуги/специализация
+  G: Ценовой сегмент          H: Сильные стороны       I: Слабые стороны
+  J: ToV и стиль контента     K: ЦА (основной сегмент) L: Активность/частота
+  M: Контент-форматы          N: Уровень угрозы (1-10) O: Что можно позаимствовать
+  P: Общая оценка/выводы      Q: Валидация             R: Описание
 
-Результаты:
-  - Вывод в консоль
-  - Google Sheets (если настроен сервисный аккаунт)
-
-Запуск:
-  export BRAVE_API_KEY=...
-  python3 search_competitors.py
+Использование:
+  python3 search_competitors.py --client nomos
+  python3 search_competitors.py --client nomos --dry-run
 """
 
-import html
-import os
-import re
-import sys
-import time
+import argparse, html, json, os, re, sys, time
 from datetime import datetime
 from urllib.parse import urlparse
 
 import requests
 
-# ── Подключаем свои модули (рядом в src/) ──
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
-from sheets import get_existing, write_results
+from sheets import get_existing, write_results, ensure_headers
 from fact_check import verify_competitor
+from client_loader import load_client, list_clients
 
-# ── Конфигурация из .env / переменных окружения ──
+# ── Токены из .env ──
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
 YT_KEY = os.getenv("YOUTUBE_API_KEY", "")
+VK_KEY = os.getenv("VK_API_KEY", "")
 APIFY_TOKEN = os.getenv("APIFY_API_TOKEN", "")
+OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
-# Факт-чекинг
-FACT_CHECK_LEVEL2 = os.getenv("FACT_CHECK_LEVEL2", "true").lower() == "true"
-FACT_CHECK_LEVEL3 = os.getenv("FACT_CHECK_LEVEL3", "false").lower() == "true"
-FACT_CHECK_STRICT = os.getenv("FACT_CHECK_STRICT", "true").lower() == "true"
+# ── Настройки ──
+VALIDATE_BATCH = os.getenv("VALIDATE_BATCH", "true").lower() == "true"
+VALIDATE_BATCH_SIZE = int(os.getenv("VALIDATE_BATCH_SIZE", "25"))
+MAX_PER_SOURCE = int(os.getenv("MAX_PER_SOURCE", "15"))  # макс с одного источника
+SOCIAL_FIRST = os.getenv("SOCIAL_FIRST", "true").lower() == "true"  # соцсети в приоритете
 
-# Таблица конкурентов (НОМОС КЛИНИК)
-SHEET_ID = os.getenv("SHEET_ID", "1zVNwBX7e8FIZ-0bP7qU2UTbueXrukoev0NbSCS9EwHQ")
-SHEET_TAB = os.getenv("SHEET_TAB", "Отчёт по конкурентам")
 
-# ── Фильтры ──
-
-# Слова-маркеры, что результат НЕ про косметологию
-BAD_KEYWORDS = [
-    "песня", "музыка", "игра", "фильм", "кино", "сериал",
-    "юмор", "прикол", "рецепт", "кулинария", "путешествия",
-    "мск 24", "новости", "спорт", "футбол",
-    "собчак", "бородина", "ургант", "иноагент",
-    "хайп", "ремонт", "стройка", "дизайн интерьера",
-    "еда", "вкусно", "готовим",
-    "авто", "машина", "drift", "тачки",
-    "халил", "halil", "hair transplant", "istanbul",
-    "животные", "собака", "кошка",
-    "lifestyle", "shopping", "макияж",
-    "оратор", "успех", "бизнес молодость",
-]
-
-# Слова-маркеры, что результат ПРО косметологию
-RELEVANT_WORDS = [
-    "клиник", "косметолог", "дерматолог", "трихолог",
-    "пластический", "эстетический", "медицин",
-    "лазерн", "инъекци", "ботокс", "филлер",
-    "омоложен", "лифтинг", "нитив", "пилинг",
-    "биоревитализаци", "акне",
-    "пересадк", "волос", "хирург",
-    "доктор", "dr.", "врач",
-    "москв", "moscow",
-]
-
-# ── Поисковые запросы ──
-
-BRAVE_QUERIES = [
-    "косметология Москва клиника сайт",
-    "пластическая хирургия Москва клиника",
-    "лазерная эпиляция Москва клиника отзывы",
-    "инъекционная косметология Москва цены",
-    "аппаратная косметология Москва центр",
-    "трихология Москва центр лечения волос",
-    "омоложение лица Москва клиника",
-    "нити лицо Москва косметолог",
-    "ботокс филлеры Москва клиника",
-    "эстетическая медицина Москва рейтинг",
-    "дерматолог косметолог Москва отзывы",
-]
-
-YT_QUERIES = [
-    "косметология Москва клиника",
-    "лазерная косметология Москва",
-    "пластическая хирургия Москва",
-    "инъекционная косметология Москва",
-    "трихология Москва",
-    "дерматолог косметолог Москва",
-    "аппаратная косметология Москва",
-    "нити лицо Москва клиника",
-    "омоложение лица Москва",
-    "лечение акне Москва",
-    "эстетическая медицина Москва",
-    "бьюти клиника Москва",
-    "косметолог москва отзывы",
-]
-
-# ── Утилиты ──
-
+# ═══════════════════════════════════════════════════
+#  Утилиты
+# ═══════════════════════════════════════════════════
 
 def fmt_subs(n):
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    elif n >= 1_000:
-        return f"{n // 1000}K"
-    return str(n)
+    if not n or n == 0:
+        return 0
+    if isinstance(n, str):
+        try: n = int(n)
+        except: return 0
+    return n
 
+def classify_source(domain, source_name=""):
+    """Определить категорию по домену."""
+    if "instagram" in domain:
+        return "Instagram — блог/бизнес-аккаунт"
+    if "tiktok" in domain:
+        return "TikTok — блог/бизнес-аккаунт"
+    if "youtube" in domain or "youtu.be" in domain:
+        return "YouTube — канал"
+    if "vk.com" in domain or "vk.ru" in domain:
+        return "VK — сообщество"
+    if source_name in ("Instagram", "TikTok", "YouTube", "VK"):
+        return f"{source_name} — профиль"
+    return "Сайт — прямой конкурент"
 
-def is_relevant(title, desc):
-    """Проверка, что результат релевантен косметологии."""
+def is_relevant(title, desc, cfg):
+    include = cfg.get("include_keywords", [])
+    exclude = cfg.get("exclude_keywords", [])
     text = f"{title} {desc}".lower()
-    for kw in BAD_KEYWORDS:
+    for kw in exclude:
         if kw.lower() in text:
             return False
-    return any(w in text for w in RELEVANT_WORDS)
-
-
-def classify_domain(domain):
-    """Определить категою конкурента по домену."""
-    if "instagram" in domain:
-        return "Прямой — косметолог/блогер"
-    if any(d in domain for d in ("prodoctorov", "otzyv", "napopravku")):
-        return "Отзовик — профиль клиники"
-    return "Прямой — клиника/косметолог"
-
+    if not include:
+        return True
+    return any(w in text for w in include)
 
 def dedup(items, key="name"):
     seen = {}
     for item in items:
-        k = item[key].lower()
+        k = item.get(key, "").lower().strip()
         if k not in seen:
             seen[k] = item
     return list(seen.values())
 
-
-def filter_with_factcheck(items):
-    """
-    Прогнать список найденных через факт-чекинг.
-    Добавляет поле fact_check в каждый item.
-    Возвращает (прошедшие, отсеянные).
-    """
-    passed = []
-    failed = []
-
-    for item in items:
-        verdict, reason = verify_competitor(
-            title=item.get("name", ""),
-            desc=item.get("positioning", "") + " " + item.get("strengths", ""),
-            url=item.get("links", ""),
-            use_level2=FACT_CHECK_LEVEL2,
-            use_level3=FACT_CHECK_LEVEL3,
-            verbose=False,
-        )
-
-        # Сохраняем вердикт факт-чекинга
-        item["fact_check"] = f"{verdict.upper()} — {reason}"
-
-        if verdict == "pass":
-            passed.append(item)
-        elif verdict == "uncertain" and not FACT_CHECK_STRICT:
-            passed.append(item)
-        else:
-            failed.append(item)
-
-    return passed, failed
+def empty_row():
+    """Пустая строка со всеми колонками."""
+    return {
+        "name": "", "category": "", "links": "", "subscribers": 0,
+        "positioning": "", "services": "", "price_segment": "",
+        "strengths": "", "weaknesses": "", "tov": "", "audience": "",
+        "activity": "", "formats": "", "threat_level": "",
+        "borrow": "", "conclusion": "", "validation": "", "description": "",
+    }
 
 
 # ═══════════════════════════════════════════════════
-#  ИСТОЧНИКИ
+#  ИСТОЧНИК 1 — Instagram (Apify)  ← ПРИОРИТЕТ
 # ═══════════════════════════════════════════════════
 
-
-def from_brave(existing_links, existing_names):
-    """Поиск через Brave Search API."""
-    if not BRAVE_API_KEY:
-        print("  [Brave] Нет BRAVE_API_KEY — пропускаем")
+def from_instagram(cfg, existing_links, existing_names):
+    """Поиск Instagram-профилей через Apify Instagram Search Scraper."""
+    if not APIFY_TOKEN:
+        print("  [Instagram] Нет APIFY_TOKEN — пропускаем")
         return []
 
+    queries = cfg.get("queries_instagram", [])
+    if not queries:
+        # Генерируем из Brave-запросов
+        base = cfg.get("title", "").split("–")[0].strip()
+        queries = [f"{base} инстаграм", f"{base} блог", f"{base} услуги"]
+        if not queries[0].strip():
+            return []
+
+    try:
+        from apify_client import ApifyClient
+    except ImportError:
+        print("  [Instagram] apify-client не установлен")
+        return []
+
+    client = ApifyClient(token=APIFY_TOKEN)
     found = []
-    for query in BRAVE_QUERIES:
-        print(f"  [Brave] {query}", end="", flush=True)
+
+    for query in queries[:3]:  # не больше 3 запросов — экономим токены
+        print(f"  [Instagram] \"{query[:50]}\"", end="", flush=True)
         try:
-            resp = requests.get(
-                "https://api.search.brave.com/res/v1/web/search",
-                params={"q": query, "count": 10, "country": "RU", "search_lang": "ru"},
-                headers={
-                    "Accept": "application/json",
-                    "Accept-Encoding": "gzip",
-                    "X-Subscription-Token": BRAVE_API_KEY,
+            run = client.actor("apify/instagram-search-scraper").call(
+                run_input={
+                    "searchType": "user",
+                    "search": query,
+                    "resultsLimit": 10,
+                    "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
                 },
-                timeout=15,
+                wait_duration=30,
             )
-            if resp.status_code != 200:
-                print(f" -> {resp.status_code}")
-                time.sleep(0.5)
+            # Fallback если wait_duration не поддерживается
+        except TypeError:
+            run = client.actor("apify/instagram-search-scraper").call(
+                run_input={
+                    "searchType": "user",
+                    "search": query,
+                    "resultsLimit": 10,
+                    "proxy": {"useApifyProxy": True},
+                },
+            )
+
+        try:
+            dataset = client.dataset(run["defaultDatasetId"])
+            items = list(dataset.iterate_items())
+        except Exception:
+            print(" ERR")
+            time.sleep(0.5)
+            continue
+
+        n = 0
+        for item in items:
+            username = item.get("username", "")
+            full_name = item.get("fullName", "") or username
+            followers = item.get("followersCount", 0) or 0
+            posts = item.get("postsCount", 0) or 0
+            bio = item.get("biography", "") or ""
+            is_biz = item.get("isBusinessAccount", False)
+            url = f"https://instagram.com/{username}"
+
+            if followers < 50:
+                continue
+            if full_name.lower().strip() in existing_names:
+                continue
+            if url.lower().rstrip("/") in existing_links:
+                continue
+            if not is_relevant(full_name, bio, cfg):
                 continue
 
-            data = resp.json()
-            n, results = 0, []
-            for grp in ("web", "news"):
-                for item in data.get(grp, {}).get("results", []):
-                    results.append(item)
+            cat = "Instagram — бизнес" if is_biz else "Instagram — блогер"
+            row = empty_row()
+            row.update({
+                "name": full_name,
+                "category": cat,
+                "links": url,
+                "subscribers": followers,
+                "positioning": bio[:300] if bio else f"Instagram-профиль @{username}",
+                "services": "—",
+                "price_segment": "—",
+                "strengths": f"Instagram. {followers} подписчиков, {posts} постов. {bio[:150]}"[:300],
+                "weaknesses": "—",
+                "tov": "—",
+                "audience": "—",
+                "activity": f"~{posts} постов" if posts else "—",
+                "formats": "Instagram (посты, stories, reels)",
+                "threat_level": min(10, (followers // 5000) + 1) if followers > 1000 else 1,
+                "borrow": "—",
+                "conclusion": f"Найден Instagram: {query}",
+                "validation": "—",
+                "description": bio[:300] if bio else "",
+            })
+            found.append(row)
+            existing_links.add(url.lower().rstrip("/"))
+            existing_names.add(full_name.lower().strip())
+            n += 1
+            if n >= MAX_PER_SOURCE:
+                break
 
-            for item in results:
-                title = html.unescape(item.get("title", "").strip())
-                desc = html.unescape(
-                    item.get("description") or item.get("snippet") or ""
-                ).strip()
-                link = item.get("url", "")
+        print(f" +{n}")
+        time.sleep(0.5)
 
-                if not title or not is_relevant(title, desc):
-                    continue
-                if title.lower() in existing_names:
-                    continue
-                if link.lower().rstrip("/") in existing_links:
-                    continue
+    return found
 
-                domain = urlparse(link).netloc.lower()
 
-                found.append({
-                    "name": title,
-                    "category": classify_domain(domain),
-                    "links": link,
-                    "subscribers": "—",
-                    "positioning": desc[:300] if desc else "Клиника косметологии",
-                    "services": "Косметологические услуги",
-                    "price_segment": "—",
-                    "strengths": f"Brave Search. {desc[:250]}".strip()[:300],
-                    "weaknesses": "—",
-                    "tov": "—",
-                    "audience": "Женщины 25–50",
-                    "activity": "—",
-                    "formats": "—",
-                    "threat_level": "—",
-                    "borrow": "—",
-                    "conclusion": f"Найден Brave Search: {query}",
-                })
+# ═══════════════════════════════════════════════════
+#  ИСТОЧНИК 2 — TikTok (Apify)  ← ПРИОРИТЕТ
+# ═══════════════════════════════════════════════════
 
-                existing_links.add(link.lower().rstrip("/"))
-                existing_names.add(title.lower())
-                n += 1
+def from_tiktok(cfg, existing_links, existing_names):
+    """Поиск TikTok-профилей через Apify TikTok Scraper."""
+    if not APIFY_TOKEN:
+        print("  [TikTok] Нет APIFY_TOKEN — пропускаем")
+        return []
 
-            print(f" +{n}")
-            time.sleep(0.3)
+    queries = cfg.get("queries_tiktok", [])
+    if not queries:
+        base = cfg.get("title", "").split("–")[0].strip()
+        niche = ""
+        desc = cfg.get("description", "")
+        if "косметолог" in desc.lower(): niche = "косметология"
+        elif "недвижимост" in desc.lower(): niche = "недвижимость лондон"
+        elif "золот" in desc.lower(): niche = "золото инвестиции"
+        queries = [f"{base}", niche] if niche else [base]
+        queries = [q for q in queries if q.strip()]
+        if not queries:
+            return []
+
+    try:
+        from apify_client import ApifyClient
+    except ImportError:
+        print("  [TikTok] apify-client не установлен")
+        return []
+
+    client = ApifyClient(token=APIFY_TOKEN)
+    found = []
+
+    for query in queries[:2]:
+        print(f"  [TikTok] \"{query[:50]}\"", end="", flush=True)
+        try:
+            run = client.actor("apify/tiktok-scraper").call(
+                run_input={
+                    "searchQueries": [query],
+                    "maxResults": 10,
+                    "searchSection": "",
+                    "proxyConfig": {"useApifyProxy": True},
+                },
+            )
         except Exception as e:
             print(f" ERR: {e}")
+            time.sleep(0.5)
+            continue
 
-    # Факт-чекинг
-    if FACT_CHECK_LEVEL2 or FACT_CHECK_LEVEL3:
-        before = len(found)
-        found, failed = filter_with_factcheck(found)
-        if failed:
-            print(f"  [fact-check] отсеяно {len(failed)}/{before}: {', '.join(i['name'][:30] for i in failed[:5])}")
-    else:
-        found = dedup(found)
+        try:
+            dataset = client.dataset(run["defaultDatasetId"])
+            items = list(dataset.iterate_items())
+        except Exception:
+            print(" ERR")
+            time.sleep(0.5)
+            continue
 
-    return dedup(found)
+        n = 0
+        for item in items:
+            # TikTok scraper возвращает разные форматы
+            author = item.get("authorMeta", {}) or item.get("author", {}) or {}
+            name = author.get("nickName") or author.get("name") or item.get("authorName", "")
+            username = author.get("name") or item.get("authorUsername", "")
+            followers = int(author.get("fans", 0) or item.get("followerCount", 0) or 0)
+            videos = int(author.get("video", 0) or item.get("videoCount", 0) or 0)
+            bio = author.get("signature", "") or item.get("description", "") or ""
+            url = f"https://tiktok.com/@{username}" if username else ""
+
+            if not name or followers < 50:
+                continue
+            if name.lower().strip() in existing_names:
+                continue
+            if url and url.lower().rstrip("/") in existing_links:
+                continue
+            if not is_relevant(name, bio, cfg):
+                continue
+
+            row = empty_row()
+            row.update({
+                "name": name,
+                "category": "TikTok — профиль",
+                "links": url,
+                "subscribers": followers,
+                "positioning": bio[:300] if bio else f"TikTok @{username}",
+                "services": "—",
+                "price_segment": "—",
+                "strengths": f"TikTok. {followers} подписчиков, {videos} видео. {bio[:150]}"[:300],
+                "weaknesses": "—",
+                "tov": "—",
+                "audience": "—",
+                "activity": f"~{videos} видео" if videos else "—",
+                "formats": "TikTok (короткие видео)",
+                "threat_level": min(10, (followers // 5000) + 1) if followers > 1000 else 1,
+                "borrow": "—",
+                "conclusion": f"Найден TikTok: {query}",
+                "validation": "—",
+                "description": bio[:300] if bio else "",
+            })
+            found.append(row)
+            existing_links.add(url.lower().rstrip("/"))
+            existing_names.add(name.lower().strip())
+            n += 1
+            if n >= MAX_PER_SOURCE:
+                break
+
+        print(f" +{n}")
+        time.sleep(0.5)
+
+    return found
 
 
-def from_youtube(existing_links, existing_names):
-    """Поиск через YouTube Data API v3."""
+# ═══════════════════════════════════════════════════
+#  ИСТОЧНИК 3 — YouTube  ← ПРИОРИТЕТ
+# ═══════════════════════════════════════════════════
+
+def from_youtube(cfg, existing_links, existing_names):
+    """Поиск YouTube-каналов."""
     if not YT_KEY:
         print("  [YouTube] Нет YOUTUBE_API_KEY — пропускаем")
         return []
 
+    queries = cfg.get("queries_youtube", [])
+    if not queries:
+        return []
+
     found = []
-    for query in YT_QUERIES:
-        print(f"  [YouTube] {query}", end="", flush=True)
+    for query in queries[:5]:
+        print(f"  [YouTube] \"{query[:50]}\"", end="", flush=True)
         try:
             resp = requests.get(
                 "https://youtube.googleapis.com/youtube/v3/search",
-                params={
-                    "part": "snippet",
-                    "q": query,
-                    "type": "channel",
-                    "maxResults": 10,
-                    "relevanceLanguage": "ru",
-                    "key": YT_KEY,
-                },
+                params={"part": "snippet", "q": query, "type": "channel",
+                        "maxResults": 8, "relevanceLanguage": "ru", "key": YT_KEY},
                 timeout=15,
             )
             if resp.status_code != 200:
-                print(f" -> {resp.status_code}")
+                print(f" HTTP {resp.status_code}")
+                time.sleep(0.3)
                 continue
 
             n = 0
@@ -306,17 +360,12 @@ def from_youtube(existing_links, existing_names):
                 title = s.get("title", "").strip()
                 cid = item["id"]["channelId"]
                 desc = s.get("description", "").strip()
-
-                if not is_relevant(title, desc):
-                    continue
-                if title.lower() in existing_names:
-                    continue
-
                 c_url = f"https://www.youtube.com/channel/{cid}"
-                if c_url.lower() in existing_links:
-                    continue
 
-                # Подписчики и видео (доп. запрос)
+                if not is_relevant(title, desc, cfg): continue
+                if title.lower() in existing_names: continue
+                if c_url.lower() in existing_links: continue
+
                 stats = {}
                 try:
                     sr = requests.get(
@@ -328,203 +377,338 @@ def from_youtube(existing_links, existing_names):
                         si = sr.json().get("items", [])
                         if si:
                             st = si[0].get("statistics", {})
-                            stats = {
-                                "subs": int(st.get("subscriberCount", 0)),
-                                "videos": int(st.get("videoCount", 0)),
-                            }
-                except Exception:
-                    pass
+                            stats = {"subs": int(st.get("subscriberCount", 0)),
+                                     "videos": int(st.get("videoCount", 0))}
+                except: pass
 
-                ss = fmt_subs(stats.get("subs", 0)) if stats else "?"
-                vc = stats.get("videos", 0) if stats else 0
-                act = f"~{vc} видео" if vc else "—"
-                strong = f"YouTube-канал"
-                if ss != "?":
-                    strong += f", {ss} подписчиков"
-                strong += f". {desc[:200]}"
-
-                found.append({
+                subs = stats.get("subs", 0)
+                vids = stats.get("videos", 0)
+                row = empty_row()
+                row.update({
                     "name": title,
-                    "category": "Прямой — клиника/косметолог",
+                    "category": "YouTube — канал",
                     "links": c_url,
-                    "subscribers": f"{ss} (YouTube)" if ss != "?" else "—",
-                    "positioning": desc[:250] if desc else "YouTube-канал по косметологии",
-                    "services": "Косметологические услуги",
+                    "subscribers": subs,
+                    "positioning": desc[:300] if desc else "YouTube-канал",
+                    "services": "—",
                     "price_segment": "—",
-                    "strengths": strong.strip()[:300],
+                    "strengths": f"YouTube. {subs} подписчиков, {vids} видео. {desc[:150]}"[:300],
                     "weaknesses": "—",
                     "tov": "—",
-                    "audience": "Женщины 25–50",
-                    "activity": act,
-                    "formats": "YouTube",
-                    "threat_level": "—",
+                    "audience": "—",
+                    "activity": f"~{vids} видео" if vids else "—",
+                    "formats": "YouTube (длинные видео, shorts)",
+                    "threat_level": min(10, (subs // 5000) + 1) if subs > 1000 else 1,
                     "borrow": "—",
                     "conclusion": f"Найден YouTube: {query}",
+                    "validation": "—",
+                    "description": desc[:300] if desc else "",
                 })
-
+                found.append(row)
                 existing_links.add(c_url.lower())
                 existing_names.add(title.lower())
                 n += 1
+                if n >= MAX_PER_SOURCE: break
 
             print(f" +{n}")
             time.sleep(0.4)
         except Exception as e:
             print(f" ERR: {e}")
 
-    # Факт-чекинг
-    if FACT_CHECK_LEVEL2 or FACT_CHECK_LEVEL3:
-        before = len(found)
-        found, failed = filter_with_factcheck(found)
-        if failed:
-            print(f"  [fact-check] отсеяно {len(failed)}/{before}")
-    else:
-        found = dedup(found)
-
-    return dedup(found)
+    return found
 
 
-def from_instagram_apify(existing_names):
-    """Поиск через Apify Instagram Profile Scraper (RESIDENTIAL proxy)."""
-    if not APIFY_TOKEN:
-        print("  [Instagram] Нет APIFY_TOKEN — пропускаем")
+# ═══════════════════════════════════════════════════
+#  ИСТОЧНИК 4 — VK
+# ═══════════════════════════════════════════════════
+
+def from_vk(cfg, existing_links, existing_names):
+    """Поиск VK-сообществ."""
+    if not VK_KEY:
+        print("  [VK] Нет VK_API_KEY — пропускаем")
         return []
 
-    print("  [Instagram] Apify Search...")
-    try:
-        from apify_client import ApifyClient
-    except ImportError:
-        print("    apify-client не установлен — пропускаем")
+    queries = cfg.get("queries_vk", [])
+    if not queries:
         return []
 
-    client = ApifyClient(token=APIFY_TOKEN)
     found = []
-
-    for query in ("косметология Москва", "пластический хирург Москва"):
-        print(f"    Поиск: {query}")
+    for query in queries[:4]:
+        print(f"  [VK] \"{query[:50]}\"", end="", flush=True)
         try:
-            run = client.actor("apify/instagram-search-scraper").call(
-                run_input={
-                    "searchType": "user",
-                    "search": query,
-                    "resultsLimit": 10,
-                    "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
-                },
-                wait_sec=60,
+            resp = requests.get(
+                "https://api.vk.com/method/newsfeed.search",
+                params={"q": query, "count": 15, "extended": 1,
+                        "access_token": VK_KEY, "v": "5.199"},
+                timeout=15,
             )
-            dataset = client.dataset(run["defaultDatasetId"])
-            items = dataset.list_items().items
+            if resp.status_code != 200:
+                print(f" HTTP {resp.status_code}")
+                time.sleep(0.5)
+                continue
 
-            for item in items:
-                username = item.get("username", "")
-                full_name = item.get("fullName", "") or username
-                followers = item.get("followerCount", 0) or 0
-                posts = item.get("postCount", 0) or 0
-                bio = item.get("biography", "") or ""
-                is_biz = item.get("isBusinessAccount", False)
+            data = resp.json()
+            if "error" in data:
+                print(f" VK: {data['error'].get('error_msg', '?')}")
+                time.sleep(0.5)
+                continue
 
-                if followers < 100 or not is_biz:
-                    continue
-                if full_name.lower() in existing_names:
-                    continue
-                if not is_relevant(full_name, bio):
-                    continue
+            groups = data.get("response", {}).get("groups", [])
+            n = 0
+            for g in groups:
+                name = g.get("name", "").strip()
+                screen_name = g.get("screen_name", "")
+                url = f"https://vk.com/{screen_name}" if screen_name else f"https://vk.com/club{g['id']}"
 
-                url = f"https://www.instagram.com/{username}/"
-                ss = fmt_subs(followers)
-                act = f"~{posts} постов" if posts else "—"
+                if not name: continue
+                if not is_relevant(name, "", cfg): continue
+                if name.lower() in existing_names: continue
+                if url.lower().rstrip("/") in existing_links: continue
 
-                found.append({
-                    "name": f"{full_name} (@{username})",
-                    "category": "Прямой — косметолог/блогер",
+                row = empty_row()
+                row.update({
+                    "name": name,
+                    "category": "VK — сообщество",
                     "links": url,
-                    "subscribers": f"{ss} (IG)",
-                    "positioning": bio[:250] if bio else "Instagram-блогер",
-                    "services": "Косметология",
+                    "subscribers": 0,
+                    "positioning": "VK-сообщество",
+                    "services": "—",
                     "price_segment": "—",
-                    "strengths": f"Instagram-блогер, {ss} подписчиков. {bio[:200]}".strip()[:300],
+                    "strengths": f"VK-сообщество. Найдено: {query}"[:300],
                     "weaknesses": "—",
                     "tov": "—",
-                    "audience": "Женщины 20–45",
-                    "activity": act,
-                    "formats": "Instagram (Reels, Stories)",
-                    "threat_level": "—",
+                    "audience": "—",
+                    "activity": "—",
+                    "formats": "VK (посты, видео, статьи)",
+                    "threat_level": 3,
                     "borrow": "—",
-                    "conclusion": "Найден через Apify Instagram.",
+                    "conclusion": f"Найден VK: {query}",
+                    "validation": "—",
+                    "description": "",
                 })
-                existing_names.add(full_name.lower())
+                found.append(row)
+                existing_links.add(url.lower().rstrip("/"))
+                existing_names.add(name.lower())
+                n += 1
+                if n >= MAX_PER_SOURCE: break
 
+            print(f" +{n}")
+            time.sleep(0.5)
         except Exception as e:
-            print(f"    ERR: {e}")
+            print(f" ERR: {e}")
 
-    return dedup(found)
+    return found
+
+
+# ═══════════════════════════════════════════════════
+#  ИСТОЧНИК 5 — Brave Search (сайты — второй план)
+# ═══════════════════════════════════════════════════
+
+def from_brave(cfg, existing_links, existing_names):
+    """Поиск через Brave Search API."""
+    if not BRAVE_API_KEY:
+        print("  [Brave] Нет BRAVE_API_KEY — пропускаем")
+        return []
+
+    queries = cfg.get("queries_brave", [])
+    if not queries:
+        return []
+
+    found = []
+    for query in queries[:6]:  # ограничиваем — сайты второй план
+        print(f"  [Brave] \"{query[:60]}\"", end="", flush=True)
+        try:
+            resp = requests.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                params={"q": query, "count": 8, "country": "RU", "search_lang": "ru"},
+                headers={"Accept": "application/json", "Accept-Encoding": "gzip",
+                         "X-Subscription-Token": BRAVE_API_KEY},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                print(f" HTTP {resp.status_code}")
+                time.sleep(0.5)
+                continue
+
+            data = resp.json()
+            n = 0
+            results = []
+            for grp in ("web", "news"):
+                for item in data.get(grp, {}).get("results", []):
+                    results.append(item)
+
+            for item in results:
+                title = html.unescape(item.get("title", "").strip())
+                desc = html.unescape(item.get("description") or item.get("snippet") or "").strip()
+                link = item.get("url", "")
+
+                if not title or not is_relevant(title, desc, cfg): continue
+                if title.lower() in existing_names: continue
+                if link.lower().rstrip("/") in existing_links: continue
+
+                domain = urlparse(link).netloc.lower()
+                row = empty_row()
+                row.update({
+                    "name": title,
+                    "category": classify_source(domain, "Сайт"),
+                    "links": link,
+                    "subscribers": 0,
+                    "positioning": desc[:300] if desc else "—",
+                    "services": "—",
+                    "price_segment": "—",
+                    "strengths": f"Сайт. {desc[:250]}"[:300],
+                    "weaknesses": "—",
+                    "tov": "—",
+                    "audience": "—",
+                    "activity": "—",
+                    "formats": "Сайт (лендинг / каталог услуг)",
+                    "threat_level": 5,
+                    "borrow": "—",
+                    "conclusion": f"Найден Brave: {query}",
+                    "validation": "—",
+                    "description": desc[:300] if desc else "",
+                })
+                found.append(row)
+                existing_links.add(link.lower().rstrip("/"))
+                existing_names.add(title.lower())
+                n += 1
+                if n >= MAX_PER_SOURCE: break
+
+            print(f" +{n}")
+            time.sleep(0.3)
+        except Exception as e:
+            print(f" ERR: {e}")
+
+    return found
 
 
 # ═══════════════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════════════
 
-
 def main():
+    parser = argparse.ArgumentParser(description="Марк1 — Поиск конкурентов (соцсети > сайты)")
+    parser.add_argument("--client", "-c", help="Имя профиля клиента")
+    parser.add_argument("--dry-run", action="store_true", help="Без записи в Sheets")
+    parser.add_argument("--list-clients", action="store_true", help="Список клиентов")
+    parser.add_argument("--sheet-id", help="ID таблицы (переопределяет профиль)")
+    parser.add_argument("--sheet-tab", default="тест3", help="Название листа (по умолчанию тест3)")
+    parser.add_argument("--sources", help="Источники через запятую: instagram,tiktok,youtube,vk,brave")
+    args = parser.parse_args()
+
+    if args.list_clients:
+        for c in list_clients():
+            print(f"  • {c}")
+        return
+
+    # ── Загрузка профиля ──
+    if args.client:
+        cfg = load_client(args.client)
+        if "error" in cfg:
+            print(f"❌ {cfg['error']}")
+            sys.exit(1)
+        sheet_id = args.sheet_id or cfg.get("sheet_id") or os.getenv("SHEET_ID", "")
+        sheet_tab = args.sheet_tab or cfg.get("sheet_tab") or os.getenv("SHEET_TAB", "тест3")
+        client_title = cfg.get("title") or cfg["name"]
+        print(f"\n📋 Клиент: {client_title}")
+        print(f"   Sheets: {sheet_id}/{sheet_tab}")
+    else:
+        cfg = {}
+        sheet_id = args.sheet_id or os.getenv("SHEET_ID", "1zVNwBX7e8FIZ-0bP7qU2UTbueXrukoev0NbSCS9EwHQ")
+        sheet_tab = args.sheet_tab or "тест3"
+        client_title = "Конкуренты (legacy)"
+        print(f"\n📋 Legacy mode")
+
+    # ── Фильтр источников ──
+    if args.sources:
+        enabled = [s.strip() for s in args.sources.split(",")]
+    else:
+        # По умолчанию — соцсети приоритет
+        enabled = cfg.get("sources", ["instagram", "tiktok", "youtube", "vk", "brave"])
+
     print("=" * 60)
-    print(f"  ПОИСК КОНКУРЕНТОВ")
+    print(f"  {client_title}")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"  fact-check L2={FACT_CHECK_LEVEL2} L3={FACT_CHECK_LEVEL3} strict={FACT_CHECK_STRICT}")
+    print(f"  Источники: {', '.join(enabled)}")
+    print(f"  dry-run={args.dry_run}")
     print("=" * 60)
 
-    # 1. Читаем существующие записи (если есть Sheets)
-    print("\n1. Существующие записи...")
+    # 1. Существующие записи
     existing_links, existing_names = set(), set()
-    if SHEET_ID:
+    if sheet_id and not args.dry_run:
         try:
-            existing_links, existing_names = get_existing(SHEET_ID, SHEET_TAB)
-            print(f"   Ссылок: {len(existing_links)}, Названий: {len(existing_names)}")
+            existing_links, existing_names = get_existing(sheet_id, sheet_tab)
+            print(f"\n1. Существующих: {len(existing_names)} названий, {len(existing_links)} ссылок")
+            ensure_headers(sheet_id, sheet_tab)
         except Exception as e:
-            print(f"   Нет доступа к Sheets или ошибка: {e}")
-            print("   Продолжаем без чтения дублей")
+            print(f"\n1. Предупреждение Sheets: {e}")
+
+    # 2-6. Сбор (соцсети первые!)
+    all_new = []
+    step = 2
+
+    source_funcs = {
+        "instagram": ("Instagram 📸", lambda: from_instagram(cfg, existing_links, existing_names)),
+        "tiktok": ("TikTok 🎵", lambda: from_tiktok(cfg, existing_links, existing_names)),
+        "youtube": ("YouTube ▶️", lambda: from_youtube(cfg, existing_links, existing_names)),
+        "vk": ("VK 💬", lambda: from_vk(cfg, existing_links, existing_names)),
+        "brave": ("Brave (сайты) 🌐", lambda: from_brave(cfg, existing_links, existing_names)),
+    }
+
+    for skey in enabled:
+        if skey not in source_funcs:
+            continue
+        sname, sfunc = source_funcs[skey]
+        print(f"\n{step}. {sname}...")
+        results = sfunc()
+        all_new.extend(results)
+        print(f"   → {len(results)} новых")
+        step += 1
+
+    # Дубли
+    total_unique = dedup(all_new)
+
+    # Валидация батчем
+    if VALIDATE_BATCH and OPENROUTER_KEY and total_unique:
+        from validate_batch import validate_candidates
+        print(f"\n{step}. Батч-валидация ({len(total_unique)} кандидатов)...")
+        relevant_all, rejected_all = [], []
+        for i in range(0, len(total_unique), VALIDATE_BATCH_SIZE):
+            batch = total_unique[i:i + VALIDATE_BATCH_SIZE]
+            rel, rej = validate_candidates(batch, cfg)
+            relevant_all.extend(rel)
+            rejected_all.extend(rej)
+            print(f"   [{i+1}-{min(i+VALIDATE_BATCH_SIZE, len(total_unique))}] ✅{len(rel)} ❌{len(rej)}")
+        total_unique = dedup(relevant_all)
+        print(f"\n{'='*60}")
+        print(f"  ПОСЛЕ ВАЛИДАЦИИ: {len(total_unique)} релевантных (отсеяно {len(rejected_all)})")
+        print(f"{'='*60}")
+        if rejected_all:
+            print(f"  Отсеяны: {', '.join(r['name'][:40] for r in rejected_all[:10])}")
+        step += 1
     else:
-        print("   SHEET_ID не задан — дубли не фильтруем")
+        print(f"\n{'='*60}")
+        print(f"  ИТОГО: {len(total_unique)} новых")
+        print(f"{'='*60}")
 
-    # 2. Brave Search
-    print("\n2. Brave Search...")
-    brave_res = from_brave(existing_links, existing_names)
-
-    # 3. YouTube
-    print("\n3. YouTube API...")
-    yt_res = from_youtube(existing_links, existing_names)
-
-    # 4. Instagram (Apify)
-    print("\n4. Instagram (Apify)...")
-    ig_res = from_instagram_apify(existing_names)
-
-    # 5. Итого
-    all_new = brave_res + yt_res + ig_res
-    print(f"\n{'=' * 60}")
-    print(f"  ИТОГО: {len(brave_res)} Brave + {len(yt_res)} YT + {len(ig_res)} IG = {len(all_new)}")
-    print(f"{'=' * 60}")
-
-    # Дефолт для fact_check (если факт-чекинг не применялся)
-    for item in all_new:
-        item.setdefault("fact_check", "—")
-
-    # 6. Запись в Google Sheets — одним батчем
-    if all_new and SHEET_ID:
-        print("\n5. Запись в Google Sheets...")
-        written = write_results(SHEET_ID, SHEET_TAB, all_new)
-        print(f"\n  Записано строк: {written}")
-    elif all_new:
-        print("\n  (dry-run) Sheets не настроен — данные только в stdout")
+    # Запись
+    if total_unique and sheet_id and not args.dry_run:
+        print(f"\n{step}. Запись в Google Sheets...")
+        written = write_results(sheet_id, sheet_tab, total_unique)
+        print(f"  ✅ Записано: {written}")
+    elif total_unique and args.dry_run:
+        print(f"\n  (dry-run) Запись пропущена")
     else:
-        print("\n  ✅ Новых конкурентов не найдено")
+        print(f"\n  {'✅ Новых не найдено' if not total_unique else '⚠️ Нет SHEET_ID'}")
 
-    # 7. Вывод топ-15
-    if all_new:
-        print("\n  Топ найденных:")
-        for item in all_new[:15]:
-            subs = item.get("subscribers", "")
-            links = item.get("links", "")
-            print(f"    • {item['name'][:36]:36s} | {subs:12s} | {links[:40]}")
-
-    print()
+    # Вывод первых результатов
+    if total_unique:
+        print(f"\n  Первые 5:")
+        for item in total_unique[:5]:
+            name = item.get("name", "?")[:50]
+            subs = item.get("subscribers", 0)
+            cat = item.get("category", "")[:30]
+            print(f"    • {name}  [{subs}]  {cat}")
 
 
 if __name__ == "__main__":

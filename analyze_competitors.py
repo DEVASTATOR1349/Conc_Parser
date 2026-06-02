@@ -61,7 +61,15 @@ def get_unanalyzed():
             rd["row_index"] = i
 
             conclusion = rd.get("conclusion", "").strip()
-            if not conclusion or "Нужна аналитика" in conclusion:
+            threat = rd.get("threat_level", "").strip()
+            tov = rd.get("tov", "").strip()
+            # Считаем непроанализированным, если нет угрозы или ToV
+            needs_ai = (
+                not threat or threat in ("—", "-", "0")
+            ) and (
+                not tov or tov in ("—", "-")
+            )
+            if needs_ai:
                 rows.append(rd)
 
         return rows

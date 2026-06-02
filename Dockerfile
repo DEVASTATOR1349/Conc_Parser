@@ -12,4 +12,4 @@ COPY . .
 # Порт для HTTP-сервера
 EXPOSE 8888
 
-CMD ["python3", "/app/http_server.py"]
+CMD ["python3", "/app/api_server.py"]
