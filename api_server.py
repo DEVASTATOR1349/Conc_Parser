@@ -30,9 +30,10 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -81,6 +82,7 @@ STATUS = {
     "last_analyze": None,
     "search_count": 0,
     "errors": [],
+    "proc": None,
 }
 
 
@@ -138,13 +140,13 @@ async def health():
 
 @app.get("/api/status")
 async def api_status():
-    return {
-        **STATUS,
-        "clients": get_client_list(),
-        "uptime_seconds": (
-            time.time() - os.stat("/proc/1/cmdline").st_mtime
-        ) if os.path.exists("/proc/1/cmdline") else None,
-    }
+    # Исключаем подпроцесс (не сериализуется в JSON)
+    status = {k: v for k, v in STATUS.items() if k != "proc"}
+    status["clients"] = get_client_list()
+    status["uptime_seconds"] = (
+        time.time() - os.stat("/proc/1/cmdline").st_mtime
+    ) if os.path.exists("/proc/1/cmdline") else None
+    return status
 
 
 # ═══════════════════════════════════════════════════
@@ -253,7 +255,7 @@ async def run_script(script: str, client: str = "", timeout: int = 300, extra_ar
     broadcast_event("job_start", {
         "script": script,
         "client": client,
-        "time": STATUS["started_at"].isoformat(),
+        "time": STATUS["started_at"],
     })
 
     try:
@@ -262,6 +264,7 @@ async def run_script(script: str, client: str = "", timeout: int = 300, extra_ar
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        STATUS["proc"] = proc
 
         # Читаем вывод построчно и транслируем
         stdout_lines = []
@@ -297,6 +300,9 @@ async def run_script(script: str, client: str = "", timeout: int = 300, extra_ar
     except Exception as e:
         broadcast_event("job_error", {"error": str(e)})
         return {"success": False, "error": str(e), "total": 0}
+
+    finally:
+        STATUS["proc"] = None
 
     # Парсим результат
     total = 0
@@ -374,16 +380,56 @@ async def analyze(
     return result
 
 
-@app.post("/api/cancel")
-async def cancel():
-    """Отменить текущую задачу."""
+
+@app.post("/api/stop")
+async def api_stop():
+    """Остановить текущую задачу."""
     if not STATUS["running"]:
         return {"success": False, "error": "Нет активных задач"}
-    # Пока просто ставим флаг
+    proc = STATUS.get("proc")
+    if proc and proc.returncode is None:
+        proc.kill()
+        # даём процессу завершиться
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            pass
     STATUS["running"] = False
     STATUS["current_job"] = None
+    STATUS["proc"] = None
     broadcast_event("job_cancelled", {"time": datetime.now().isoformat()})
     return {"success": True}
+
+
+@app.post("/api/cancel")
+async def cancel():
+    """Отменить текущую задачу (алиас /api/stop)."""
+    return await api_stop()
+
+
+# ═══════════════════════════════════════════════════
+#  Алиасы для n8n (/competitors/*)
+# ═══════════════════════════════════════════════════
+
+@app.post("/competitors/search")
+async def competitors_search(
+    client: str = Query("", description="Имя профиля клиента"),
+    sources: str = Query("", description="Источники: instagram,tiktok,youtube,vk,brave"),
+    sheet_id: str = Query("", description="ID Google таблицы"),
+    sheet_tab: str = Query("тест3", description="Название листа"),
+    timeout: int = Query(300, ge=30, le=900, description="Таймаут в секундах"),
+):
+    """Алиас /competitors/search → /api/search для n8n."""
+    return await search(client, sources, sheet_id, sheet_tab, timeout)
+
+
+@app.post("/competitors/analyze")
+async def competitors_analyze(
+    client: str = Query("", description="Имя профиля клиента"),
+    timeout: int = Query(600, ge=60, le=1800, description="Таймаут в секундах"),
+):
+    """Алиас /competitors/analyze → /api/analyze для n8n."""
+    return await analyze(client, timeout)
 
 
 # ═══════════════════════════════════════════════════
@@ -894,8 +940,82 @@ setInterval(async () => {
 #  Точка входа
 # ═══════════════════════════════════════════════════
 
+
+@app.get("/api/routes")
+async def list_routes():
+    """Список всех зарегистрированных маршрутов."""
+    routes = []
+    for route in app.routes:
+        methods = list(route.methods) if hasattr(route, "methods") else []
+        if methods:
+            routes.append({"path": route.path, "methods": methods})
+    return {"routes": routes}
+
+
+def _scheduled_search():
+    """Ежедневный автозапуск для всех клиентов в 5:00 MSK."""
+    while True:
+        now = datetime.now()
+        target = now.replace(hour=5, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        wait_sec = int((target - now).total_seconds())
+        print(f"  ⏰ Следующий автозапуск: {target} (через {wait_sec // 3600}ч {(wait_sec % 3600) // 60}м)")
+        time.sleep(wait_sec)
+
+        if STATUS.get("running"):
+            print("  ⏭️ Пропуск: уже выполняется задача")
+            continue
+
+        clients = get_client_list()
+        print(f"  🚀 Автозапуск для {len(clients)} клиентов...")
+        for client_name in clients:
+            if STATUS.get("running"):
+                print(f"  ⏭️ Пропуск {client_name}: уже выполняется")
+                break
+            try:
+                import subprocess as _sp
+                cmd = ["python3", str(APP_DIR / "search_competitors.py"),
+                       "--client", client_name,
+                       "--sources", os.getenv("SCHEDULER_SOURCES", "brave")]
+                print(f"  🔍 {client_name}: поиск конкурентов...")
+                result = _sp.run(cmd, capture_output=True, text=True, timeout=600)
+                if result.returncode == 0:
+                    print(f"  ✅ {client_name}: поиск завершён")
+                else:
+                    stderr_tail = result.stderr[-300:] if result.stderr else ""
+                    print(f"  ⚠️ {client_name}: ошибка\n{stderr_tail}")
+            except _sp.TimeoutExpired:
+                print(f"  ⚠️ {client_name}: таймаут поиска")
+            except Exception as e:
+                print(f"  ⚠️ {client_name}: {e}")
+
+        # Анализ
+        for client_name in clients:
+            try:
+                import subprocess as _sp
+                cmd = ["python3", str(APP_DIR / "analyze_competitors.py"), "--client", client_name]
+                print(f"  🧠 {client_name}: анализ...")
+                result = _sp.run(cmd, capture_output=True, text=True, timeout=900)
+                if result.returncode == 0:
+                    print(f"  ✅ {client_name}: анализ завершён")
+                else:
+                    print(f"  ⚠️ {client_name}: ошибка анализа")
+            except _sp.TimeoutExpired:
+                print(f"  ⚠️ {client_name}: таймаут анализа")
+            except Exception as e:
+                print(f"  ⚠️ {client_name}: {e}")
+
+
 def main():
     port = int(os.getenv("PORT", "8888"))
+
+    scheduler_enabled = os.getenv("SCHEDULER_ENABLED", "1") == "1"
+    if scheduler_enabled:
+        t = threading.Thread(target=_scheduled_search, daemon=True)
+        t.start()
+        print(f"  ⏰ Шедулер включён (ежедневно 5:00 MSK)")
+
     print(f"🚀 Марк1 API на http://0.0.0.0:{port}")
     print(f"   Веб-интерфейс: http://0.0.0.0:{port}/")
     print(f"   Swagger docs:  http://0.0.0.0:{port}/docs")

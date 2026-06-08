@@ -126,7 +126,16 @@ def validate_candidates(items: list[dict], client_config: dict) -> tuple[list[di
             print(f"    [validate] API error {resp.status_code}: {resp.text[:150]}")
             return items, []
         
-        text = resp.json()["choices"][0]["message"]["content"].strip()
+        resp_json = resp.json()
+        choices = resp_json.get("choices", [])
+        if not choices:
+            print(f"    [validate] Empty choices: {resp.text[:200]}")
+            return items, []
+        msg = choices[0].get("message", {})
+        text = (msg.get("content") or "").strip()
+        if not text:
+            print(f"    [validate] Empty content, refusal: {msg.get('refusal','')[:100]}")
+            return items, []
         
         # Извлекаем JSON
         json_match = re.search(r'\[.*\]', text, re.DOTALL)

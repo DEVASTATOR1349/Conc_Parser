@@ -64,15 +64,29 @@ def load_client(name: str) -> Dict:
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
 
+    # Авто-форматирование MD если нужно
+    if "Поисковые запросы" not in text and "queries_" not in text:
+        try:
+            from client_formatter import format_md_to_parser
+            formatted = format_md_to_parser(text)
+            if formatted and formatted != text:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(formatted)
+                text = formatted
+                print(f"  ✅ MD авто-отформатирован и сохранён: {name}")
+        except Exception as e:
+            print(f"  ⚠️ Не удалось отформатировать MD: {e}")
+
     sections = _split_sections(text)
     config = {"name": name, "title": _extract_title(text)}
 
     # Парсим секции
     raw_queries = sections.get("Поисковые запросы", "")
-    config["queries_brave"] = _parse_list(raw_queries, "queries_brave")
+    config["queries_instagram"] = _parse_list(raw_queries, "queries_instagram")
+    config["queries_tiktok"] = _parse_list(raw_queries, "queries_tiktok")
     config["queries_youtube"] = _parse_list(raw_queries, "queries_youtube")
     config["queries_vk"] = _parse_list(raw_queries, "queries_vk")
-    config["queries_instagram"] = _parse_list(raw_queries, "queries_instagram")
+    config["queries_brave"] = _parse_list(raw_queries, "queries_brave")
 
     raw_filters = sections.get("Фильтры", "")
     config["include_keywords"] = _parse_list(raw_filters, "include_keywords")

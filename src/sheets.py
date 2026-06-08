@@ -1,6 +1,25 @@
 """
-Работа с Google Sheets (самостоятельно, без привязки к apify-parser).
-Использует googleapiclient с сервисным аккаунтом.
+sheets.py — Работа с Google Sheets (автономно, без apify-parser).
+
+Колонки (A→R):
+  A: Конкурент (название)
+  B: Категория
+  C: Ссылки (сайт/соцсети)
+  D: Подписчики (всего)        ← ЧИСЛО, RAW
+  E: Позиционирование / УТП
+  F: Услуги / специализация
+  G: Ценовой сегмент
+  H: Сильные стороны
+  I: Слабые стороны / точки роста
+  J: ToV и стиль контента
+  K: ЦА (основной сегмент)
+  L: Активность / частота
+  M: Контент-форматы
+  N: Уровень угрозы (1-10)     ← ЧИСЛО, RAW
+  O: Что можно позаимствовать
+  P: Общая оценка / выводы
+  Q: Валидация
+  R: Описание (от LLM)
 """
 
 import json
@@ -12,37 +31,57 @@ from googleapiclient.discovery import build
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+# Маппинг: ключ → номер колонки (0-based)
+COLUMN_MAP = {
+    "name": 0,         # A
+    "category": 1,     # B
+    "links": 2,        # C
+    "subscribers": 3,  # D — число
+    "positioning": 4,  # E
+    "services": 5,     # F
+    "price_segment": 6,# G
+    "strengths": 7,    # H
+    "weaknesses": 8,   # I
+    "tov": 9,          # J
+    "audience": 10,    # K
+    "activity": 11,    # L
+    "formats": 12,     # M
+    "threat_level": 13,# N — число
+    "borrow": 14,      # O
+    "conclusion": 15,  # P
+    "validation": 16,  # Q
+    "description": 17, # R
+}
+TOTAL_COLS = len(COLUMN_MAP)  # 18
+
+NUMERIC_COLS = {3, 13}  # D (subscribers), N (threat_level)
+
 
 def get_credentials():
-    """Получить credentials из GOOGLE_CREDENTIALS_JSON или GOOGLE_APPLICATION_CREDENTIALS."""
     creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
     if creds_json:
-        creds_dict = json.loads(creds_json)
-        return service_account.Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-
+        return service_account.Credentials.from_service_account_info(
+            json.loads(creds_json), scopes=SCOPES
+        )
     creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     if creds_path and os.path.exists(creds_path):
         return service_account.Credentials.from_service_account_file(creds_path, scopes=SCOPES)
-
     return None
 
 
 def get_service():
-    """Получить Sheets API сервис."""
     creds = get_credentials()
     if not creds:
-        print("  [sheets] Нет GOOGLE_CREDENTIALS_JSON или GOOGLE_APPLICATION_CREDENTIALS")
+        print("  [sheets] Нет credentials")
         return None
-    service = build("sheets", "v4", credentials=creds)
-    return service
+    return build("sheets", "v4", credentials=creds)
 
 
 def get_existing(spreadsheet_id: str, tab: str) -> tuple[set, set]:
-    """Прочитать (ссылки, названия) первой колонки таблицы."""
+    """Вернуть (множество ссылок, множество названий) из таблицы."""
     service = get_service()
     if not service:
         return set(), set()
-
     try:
         result = service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
@@ -50,85 +89,108 @@ def get_existing(spreadsheet_id: str, tab: str) -> tuple[set, set]:
         ).execute()
         values = result.get("values", [])
         links, names = set(), set()
+        import re
         for row in values[1:]:
             if len(row) > 0:
                 names.add(row[0].strip().lower())
             if len(row) > 2:
-                import re
                 for link in re.split(r'[,;\s]+', row[2].strip()):
                     link = link.strip().rstrip("/")
                     if link:
                         links.add(link.lower())
         return links, names
     except Exception as e:
-        print(f"  [sheets] Ошибка чтения: {e}")
+        print(f"  [sheets] Ошибка чтения существующих: {e}")
         return set(), set()
 
 
-def write_results(spreadsheet_id: str, tab: str, rows: list[dict]) -> int:
-    """Записать строки в таблицу одним батчем (один API-вызов)."""
+def write_results(spreadsheet_id: str, tab: str, rows: list[dict], dry_run: bool = False) -> int:
+    """
+    Записать строки в таблицу.
+    Числовые поля (subscribers, threat_level) пишутся как числа через RAW.
+    """
     if not rows:
         return 0
+    if dry_run:
+        for row in rows:
+            print(f"  [dry] {row.get('name', '?')[:40]}")
+        return len(rows)
 
     service = get_service()
     if not service:
         print("  [sheets] Нет доступа — запись невозможна")
         return 0
 
-    fmap = {
-        "name": 0, "category": 1, "links": 2, "subscribers": 3,
-        "positioning": 4, "services": 5, "price_segment": 6,
-        "strengths": 7, "weaknesses": 8, "tov": 9, "audience": 10,
-        "activity": 11, "formats": 12, "threat_level": 13,
-        "borrow": 14, "conclusion": 15, "fact_check": 16,
-    }
-
     values = []
     for row in rows:
-        vals = [""] * 17  # A–Q
-        for key, col in fmap.items():
-            if key in row:
-                vals[col] = str(row[key])
+        vals = [""] * TOTAL_COLS
+        for key, col in COLUMN_MAP.items():
+            val = row.get(key)
+            if val is None:
+                continue
+            if col in NUMERIC_COLS:
+                try:
+                    vals[col] = int(val)
+                except (ValueError, TypeError):
+                    vals[col] = val  # fallback
+            else:
+                vals[col] = str(val) if val else ""
         values.append(vals)
 
     try:
         service.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id,
-            range=f"{tab}!A:Q",
-            valueInputOption="USER_ENTERED",
+            range=f"{tab}!A:R",
+            valueInputOption="RAW",       # ← RAW чтобы числа не оборачивались в апострофы
             insertDataOption="INSERT_ROWS",
-            body={"values": values}
+            body={"values": values},
         ).execute()
-        print(f"  [sheets] Записано: {len(values)} (одним батчем)")
+        print(f"  [sheets] Записано: {len(values)} строк")
         return len(values)
     except Exception as e:
         print(f"  [sheets] Ошибка записи: {e}")
         return 0
 
 
-def update_cells(spreadsheet_id: str, tab: str, row_index: int, updates: dict) -> bool:
-    """Обновить конкретные ячейки строки. updates: {col_letter: value}."""
+def ensure_headers(spreadsheet_id: str, tab: str):
+    """Убедиться что заголовки в строке 1 корректные. Создаёт лист если его нет."""
     service = get_service()
     if not service:
-        return False
+        return
 
-    data = []
-    for col_letter, value in updates.items():
-        if value:
-            data.append({
-                "range": f"{tab}!{col_letter}{row_index}",
-                "values": [[str(value)]],
-            })
-
-    if not data:
-        return False
+    HEADERS = [
+        "Конкурент (название)", "Категория", "Ссылки (сайт/соцсети)",
+        "Подписчики (всего)", "Позиционирование / УТП", "Услуги / специализация",
+        "Ценовой сегмент", "Сильные стороны", "Слабые стороны / точки роста",
+        "ToV и стиль контента", "ЦА (основной сегмент)", "Активность / частота",
+        "Контент-форматы", "Уровень угрозы (1-10)", "Что можно позаимствовать",
+        "Общая оценка / выводы", "Валидация", "Описание",
+    ]
 
     try:
-        service.spreadsheets().values().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={"valueInputOption": "USER_ENTERED", "data": data}
+        # Сначала пытаемся прочитать — существует ли лист
+        service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=f"{tab}!A1:A1"
         ).execute()
-        return True
+    except Exception:
+        # Лист не существует — создаём
+        try:
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": [{"addSheet": {"properties": {"title": tab}}}]},
+            ).execute()
+            print(f"  [sheets] Создан новый лист: {tab}")
+        except Exception as e:
+            print(f"  [sheets] Не удалось создать лист {tab}: {e}")
+            return
+
+    try:
+        service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab}!A1:R1",
+            valueInputOption="RAW",
+            body={"values": [HEADERS]},
+        ).execute()
+        print(f"  [sheets] Заголовки обновлены в {tab}")
     except Exception as e:
-        print(f"  [sheets] Ошибка обновления: {e}")
-        return False
+        print(f"  [sheets] Ошибка заголовков: {e}")
