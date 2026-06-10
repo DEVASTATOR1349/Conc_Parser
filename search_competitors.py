@@ -89,6 +89,8 @@ def is_relevant(title, desc, cfg):
 def dedup(items, key="name"):
     seen = {}
     for item in items:
+        if not isinstance(item, dict):
+            continue
         k = item.get(key, "").lower().strip()
         if k not in seen:
             seen[k] = item
@@ -1047,6 +1049,8 @@ def from_brave(cfg, existing_links, existing_names):
                     results.append(item)
 
             for item in results:
+                if not isinstance(item, dict):
+                    continue
                 title = html.unescape(item.get("title", "").strip())
                 desc = html.unescape(item.get("description") or item.get("snippet") or "").strip()
                 link = item.get("url", "")
@@ -1316,6 +1320,12 @@ def main():
     # 🔍 Пост-валидация: проверка и дозаполнение недостающих данных (до 2 попыток)
     if total_unique:
         total_unique = validate_and_repair(total_unique, cfg)
+
+    # Лимит max_total (из конфига)
+    max_total = cfg.get("max_total")
+    if max_total and len(total_unique) > max_total:
+        total_unique = total_unique[:max_total]
+        print(f"  🎯 Обрезано до {max_total} (max_total из конфига)")
 
     # Запись
     if total_unique and sheet_id and not args.dry_run:
