@@ -112,32 +112,46 @@ def get_unanalyzed():
 def ai_analyze(name, links, positioning, services):
     """Прогнать конкурента через LLM."""
 
-    prompt = f"""Ты — аналитик конкурентов в косметологии. Проанализируй данные:
+    prompt = f"""Ты — аналитик конкурентов в косметологии и эстетической медицине. Твоя задача — проанализировать конкурента клиники НОМОС (Москва) и заполнить ВСЕ поля.
 
+ДАННЫЕ:
 - Название: {name}
 - Ссылки: {links}
-- Позиционирование: {positioning}
-- Услуги: {services}
+- Описание: {positioning}
+- Услуги (если известны): {services}
 
-Заполни JSON:
-1. tov_style — тон общения (ламповый/агрессивный/экспертный/молодёжный/академичный) + почему (1-2 предложения)
-2. target_audience — пол, возраст, доход, интересы
-3. threat_level — угроза 1-10 (10 = прямой опасный конкурент)
-4. borrow — 3-5 идей что позаимствовать из контента
-5. weaknesses — 3 слабые стороны
-6. strengths_enhanced — 1-2 предложения сильных сторон
-7. conclusion — общий вердикт (3-4 предложения: чем опасен, что умеет, как обходить)
+Заполни строго JSON со ВСЕМИ полями ниже. Не пропускай ни одного:
 
-Верни ТОЛЬКО JSON:
+1. **services_specialization** (строка) — какие косметологические/медицинские услуги оказывает: инъекции, лазер, нити, пластика, трихология, эпиляция, омоложение, anti-age, акне, дерматология и т.д. Перечисли через запятую. Если данных мало — предположи по названию/описанию, поставь "?" в конце спорных.
+2. **positioning_utp** (строка) — как позиционируется: премиум/доступный/семейный/экспертный/узкоспециализированный. 1-2 предложения УТП.
+3. **price_segment** (строка) — ценовой сегмент: эконом / средний / средний+ / премиум / люкс. Обоснуй 1 фразой.
+4. **tov_style** (строка) — тон общения: ламповый / агрессивный / экспертный / молодёжный / академичный. 1-2 предложения почему.
+5. **target_audience** (строка) — ЦА: пол, возраст, доход, интересы (2-3 предложения).
+6. **threat_level** (число 1-10) — уровень угрозы для НОМОС (10 = прямой опасный конкурент в том же сегменте).
+7. **borrow** (строка) — 3-5 идей что позаимствовать из контента/маркетинга/услуг.
+8. **weaknesses** (массив из 3 строк) — 3 слабые стороны/точки роста.
+9. **strengths_enhanced** (строка) — 2-3 сильные стороны конкурента.
+10. **activity_frequency** (строка) — предполагаемая частота постинга: ежедневно / 2-3 в неделю / еженедельно / редко.
+11. **content_formats** (строка) — форматы контента: Reels/Stories/посты/лайвы/экспертные статьи/до-после/отзывы/обзоры процедур.
+12. **conclusion** (строка) — общий вердикт (3-4 предложения: чем опасен, что умеет, как обходить).
+13. **is_clinic** (строка) — YES если это реальная клиника/салон/кабинет оказывающий услуги, NO если информационный сайт/блог/магазин/другое.
+
+Верни ТОЛЬКО валидный JSON, без markdown-комментариев:
 ```json
 {{
+  "services_specialization": "...",
+  "positioning_utp": "...",
+  "price_segment": "...",
   "tov_style": "...",
   "target_audience": "...",
   "threat_level": 5,
   "borrow": "...",
   "weaknesses": ["...", "...", "..."],
   "strengths_enhanced": "...",
-  "conclusion": "..."
+  "activity_frequency": "...",
+  "content_formats": "...",
+  "conclusion": "...",
+  "is_clinic": "YES"
 }}
 ```"""
 
@@ -169,22 +183,34 @@ def update_row(service, ai_result, row_index):
     if not ai_result:
         return False
 
-    # Колонки: H=сильные, I=слабые, J=ToV, K=ЦА, L=активность, M=форматы, N=угроза, O=позаимствовать, P=вывод
+    # ВСЕ КОЛОНКИ: E=позиционирование, F=услуги, G=ценовой, H=сильные, I=слабые, J=ToV, K=ЦА, L=активность, M=форматы, N=угроза, O=заимств, P=вердикт, Q=валидация
     updates = {}
+    if ai_result.get("positioning_utp"):
+        updates["E"] = ai_result["positioning_utp"]
+    if ai_result.get("services_specialization"):
+        updates["F"] = ai_result["services_specialization"]
+    if ai_result.get("price_segment"):
+        updates["G"] = ai_result["price_segment"]
     if ai_result.get("strengths_enhanced"):
         updates["H"] = ai_result["strengths_enhanced"]
     if ai_result.get("weaknesses"):
-        updates["I"] = "\n".join(ai_result["weaknesses"])
+        updates["I"] = "\n".join(ai_result["weaknesses"]) if isinstance(ai_result["weaknesses"], list) else str(ai_result["weaknesses"])
     if ai_result.get("tov_style"):
         updates["J"] = ai_result["tov_style"]
     if ai_result.get("target_audience"):
         updates["K"] = ai_result["target_audience"]
+    if ai_result.get("activity_frequency"):
+        updates["L"] = ai_result["activity_frequency"]
+    if ai_result.get("content_formats"):
+        updates["M"] = ai_result["content_formats"]
     if ai_result.get("threat_level"):
         updates["N"] = str(ai_result["threat_level"])
     if ai_result.get("borrow"):
         updates["O"] = ai_result["borrow"]
     if ai_result.get("conclusion"):
         updates["P"] = ai_result["conclusion"]
+    if ai_result.get("is_clinic"):
+        updates["Q"] = ai_result["is_clinic"]
 
     return update_cells(SHEET_ID, SHEET_TAB, row_index, updates)
 

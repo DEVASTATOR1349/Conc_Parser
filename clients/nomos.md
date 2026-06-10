@@ -106,8 +106,8 @@ exclude_keywords:
   - макияж
 
 ## Google Sheets
-sheet_id: 10S1xijZ4ZNXVB4JQKyBylFmc7N_jwazHKSTc9pNj-t8
-sheet_tab: тест3
+sheet_id: 1zVNwBX7e8FIZ-0bP7qU2UTbueXrukoev0NbSCS9EwHQ
+sheet_tab: Отчёт по конкурентам
 
 ## Источники
 sources:
@@ -116,3 +116,6 @@ sources:
   - youtube
   - vk
   - brave
+
+## Лимиты
+max_total: 50
