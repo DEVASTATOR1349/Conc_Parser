@@ -63,7 +63,7 @@ def _ai_request(payload, max_tries=2):
 
 
 def get_unanalyzed():
-    """Читаем строки, где вывод пустой или 'Нужна аналитика'."""
+    """Читаем строки с пустыми ключевыми полями аналитики."""
     service = get_service()
     if not service:
         return []
@@ -71,43 +71,47 @@ def get_unanalyzed():
     try:
         result = service.spreadsheets().values().get(
             spreadsheetId=SHEET_ID,
-            range=f"{SHEET_TAB}!A:P"
+            range=f"{SHEET_TAB}!A:R"
         ).execute()
         values = result.get("values", [])
 
-        rows = []
         col_map = {
             "name": 0, "category": 1, "links": 2, "subscribers": 3,
             "positioning": 4, "services": 5, "price_segment": 6,
             "strengths": 7, "weaknesses": 8, "tov": 9, "audience": 10,
             "activity": 11, "formats": 12, "threat_level": 13,
-            "borrow": 14, "conclusion": 15,
+            "borrow": 14, "conclusion": 15, "validation": 16, "description": 17,
         }
 
+        def empty(val):
+            v = str(val).strip()
+            return not v or v in ("—", "-", "0", "")
+
+        rows = []
         for i, row in enumerate(values[1:], start=2):
-            row = row + [""] * (16 - len(row))
+            row = row + [""] * (18 - len(row))
             rd = {"row_index": i}
             for key, col in col_map.items():
                 rd[key] = row[col] if col < len(row) else ""
-            rd["row_index"] = i
 
-            conclusion = rd.get("conclusion", "").strip()
-            threat = rd.get("threat_level", "").strip()
-            tov = rd.get("tov", "").strip()
-            # Считаем непроанализированным, если нет угрозы или ToV
-            needs_ai = (
-                not threat or threat in ("—", "-", "0")
-            ) and (
-                not tov or tov in ("—", "-")
-            )
-            if needs_ai:
+            # Проверяем ключевые поля: услуги, цена, слабые, ToV, ЦА, заимств, вердикт
+            key_fields = [
+                rd.get("services", ""),
+                rd.get("price_segment", ""),
+                rd.get("weaknesses", ""),
+                rd.get("tov", ""),
+                rd.get("audience", ""),
+                rd.get("borrow", ""),
+                rd.get("conclusion", ""),
+            ]
+            missing_count = sum(1 for f in key_fields if empty(f))
+            if missing_count >= 2:
                 rows.append(rd)
 
         return rows
     except Exception as e:
         print(f"  [analyze] Ошибка чтения: {e}")
         return []
-
 
 def ai_analyze(name, links, positioning, services):
     """Прогнать конкурента через LLM."""
@@ -234,7 +238,7 @@ def main():
         return
 
     # Ограничиваем batch
-    batch = rows[:20]
+    batch = rows[:50]
     print(f"\n2. Анализ {len(batch)} конкурентов через AI...\n")
 
     service = None
