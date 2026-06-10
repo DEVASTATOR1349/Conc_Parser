@@ -27,8 +27,33 @@ import requests
 
 # ── AI опционально ──
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-AI_MODEL = "google/gemini-2.0-flash-001"
+AI_MODEL = "google/gemini-2.5-flash"
+AI_FALLBACK_MODEL = "deepseek/deepseek-v4-flash"
 AI_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def _ai_request(payload, max_tries=2):
+    """OpenRouter request with automatic fallback to FALLBACK_MODEL."""
+    models_to_try = [payload.get("model", AI_MODEL), AI_FALLBACK_MODEL]
+    for attempt in range(max_tries):
+        model = models_to_try[attempt] if attempt < len(models_to_try) else models_to_try[-1]
+        payload["model"] = model
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        try:
+            resp = requests.post(AI_API_URL, json=payload, headers=headers, timeout=20)
+            if resp.status_code == 200:
+                return resp
+            if resp.status_code in (400, 404):
+                continue
+            return None
+        except requests.exceptions.Timeout:
+            continue
+        except Exception:
+            continue
+    return None
 
 # ═══════════════════════════════════════════════════════
 #  УРОВЕНЬ 1 — Быстрые маркеры (regex, без запросов)
@@ -259,23 +284,15 @@ def level3_check(title: str, desc: str) -> tuple:
 Без объяснений. Только YES или NO."""
 
     try:
-        resp = requests.post(
-            AI_API_URL,
-            json={
-                "model": AI_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.0,
-                "max_tokens": 10,
-            },
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            timeout=15,
-        )
-
-        if resp.status_code != 200:
-            return "uncertain", f"AI: HTTP {resp.status_code}"
+        payload = {
+            "model": AI_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.0,
+            "max_tokens": 10,
+        }
+        resp = _ai_request(payload)
+        if resp is None:
+            return "uncertain", "AI: все модели недоступны"
 
         answer = resp.json()["choices"][0]["message"]["content"].strip().upper()
 

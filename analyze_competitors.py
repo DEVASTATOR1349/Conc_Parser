@@ -27,8 +27,39 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 SHEET_ID = os.getenv("SHEET_ID", "1zVNwBX7e8FIZ-0bP7qU2UTbueXrukoev0NbSCS9EwHQ")
 SHEET_TAB = os.getenv("SHEET_TAB", "Отчёт по конкурентам")
 
-MODEL = "google/gemini-2.0-flash-001"
+MODEL = "google/gemini-2.5-flash"
+FALLBACK_MODEL = "deepseek/deepseek-v4-flash"
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def _ai_request(payload, max_tries=2):
+    """OpenRouter request with automatic fallback to FALLBACK_MODEL."""
+    models_to_try = [payload.get("model", MODEL), FALLBACK_MODEL]
+    for attempt in range(max_tries):
+        model = models_to_try[attempt] if attempt < len(models_to_try) else models_to_try[-1]
+        payload["model"] = model
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/DEVASTATOR1349/Conc_Parser",
+        }
+        try:
+            resp = requests.post(API_URL, json=payload, headers=headers, timeout=120)
+            if resp.status_code == 200:
+                return resp
+            if resp.status_code in (400, 404):
+                msg = resp.json().get("error", {}).get("message", "")
+                print(f"  [AI] {model}: {resp.status_code} ({msg[:60]}) -> fallback...", end=" ", flush=True)
+                continue
+            print(f"  [AI] {model}: {resp.status_code}")
+            return None
+        except requests.exceptions.Timeout:
+            print(f"  [AI] {model}: timeout -> fallback...", end=" ", flush=True)
+            continue
+        except Exception as e:
+            print(f"  [AI] {model}: {e} -> fallback...", end=" ", flush=True)
+            continue
+    return None
 
 
 def get_unanalyzed():
@@ -117,16 +148,10 @@ def ai_analyze(name, links, positioning, services):
         "max_tokens": 1000,
     }
 
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/DEVASTATOR1349/Conc_Parser",
-    }
-
     try:
-        resp = requests.post(API_URL, json=payload, headers=headers, timeout=60)
-        if resp.status_code != 200:
-            print(f"  [AI] API: {resp.status_code}")
+        resp = _ai_request(payload)
+        if resp is None:
+            print("  [AI] все модели недоступны")
             return None
 
         content = resp.json()["choices"][0]["message"]["content"]

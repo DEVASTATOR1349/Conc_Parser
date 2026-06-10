@@ -194,3 +194,28 @@ def ensure_headers(spreadsheet_id: str, tab: str):
         print(f"  [sheets] Заголовки обновлены в {tab}")
     except Exception as e:
         print(f"  [sheets] Ошибка заголовков: {e}")
+
+def update_cells(spreadsheet_id: str, tab: str, row_index: int, updates: dict) -> bool:
+    """Update specific cells in a row. updates: {"H": "value", ...}"""
+    service = get_service()
+    if not service or not updates:
+        return bool(service)
+
+    col_map = {"A":0,"B":1,"C":2,"D":3,"E":4,"F":5,"G":6,"H":7,"I":8,"J":9,"K":10,"L":11,"M":12,"N":13,"O":14,"P":15,"Q":16,"R":17}
+    values = [[""] * 18]
+    for col_letter, val in updates.items():
+        idx = col_map.get(col_letter.upper())
+        if idx is not None:
+            values[0][idx] = val
+
+    try:
+        service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tab}!A{row_index}:R{row_index}",
+            valueInputOption="RAW",
+            body={"values": values},
+        ).execute()
+        return True
+    except Exception as e:
+        print(f"  [sheets] row {row_index}: {e}")
+        return False
