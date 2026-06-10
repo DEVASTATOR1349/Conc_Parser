@@ -1052,7 +1052,7 @@ def from_brave(cfg, existing_links, existing_names):
                 link = item.get("url", "")
                 # Extra snippets могут содержать доп. информацию
                 extra_snippets = item.get("extra_snippets", []) or []
-                extra_text = " ".join([e.get("text","") for e in extra_snippets])[:200] if extra_snippets else ""
+                extra_text = " ".join(extra_snippets)[:200] if extra_snippets else ""
 
                 if not title or not is_relevant(title, desc, cfg): continue
                 if title.lower() in existing_names: continue
