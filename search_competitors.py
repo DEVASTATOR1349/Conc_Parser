@@ -76,15 +76,12 @@ def classify_source(domain, source_name=""):
     return "Сайт — прямой конкурент"
 
 def is_relevant(title, desc, cfg):
-    include = cfg.get("include_keywords", [])
     exclude = cfg.get("exclude_keywords", [])
     text = f"{title} {desc}".lower()
     for kw in exclude:
         if kw.lower() in text:
             return False
-    if not include:
-        return True
-    return any(w in text for w in include)
+    return True  # Пусть AI-валидация решает, не жёсткий текстовый фильтр
 
 def dedup(items, key="name"):
     seen = {}
@@ -134,14 +131,14 @@ def from_instagram(cfg, existing_links, existing_names):
     client = ApifyClient(token=APIFY_TOKEN)
     found = []
 
-    for query in queries[:3]:  # не больше 3 запросов — экономим токены
+    for query in queries[:5]:  # Instagram: 5 запросов
         print(f"  [Instagram] \"{query[:50]}\"", end="", flush=True)
         try:
             run = client.actor("apify/instagram-search-scraper").call(
                 run_input={
                     "searchType": "user",
                     "search": query,
-                    "resultsLimit": 10,
+                    "resultsLimit": 20,
                     "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
                 },
                 wait_duration=30,
@@ -152,7 +149,7 @@ def from_instagram(cfg, existing_links, existing_names):
                     run_input={
                         "searchType": "user",
                         "search": query,
-                        "resultsLimit": 10,
+                        "resultsLimit": 20,
                         "proxy": {"useApifyProxy": True},
                     },
                 )
@@ -273,6 +270,7 @@ def from_instagram(cfg, existing_links, existing_names):
             row.update({
                 "name": full_name,
                 "category": cat,
+                "_source": "instagram",
                 "links": url,
                 "subscribers": followers,
                 "positioning": bio[:300] if bio else f"Instagram-профиль @{username}",
@@ -336,13 +334,13 @@ def from_tiktok(cfg, existing_links, existing_names):
     seen_profiles = set()
     found = []
 
-    for query in queries[:2]:
+    for query in queries[:5]:  # TikTok: 5 запросов
         print(f"  [TikTok] \"{query[:50]}\"", end="", flush=True)
         try:
             run = client.actor("clockworks/tiktok-scraper").call(
                 run_input={
                     "searchQueries": [query],
-                    "maxProfilesPerQuery": 10,
+                    "maxProfilesPerQuery": 20,
                     "searchSection": "",
                     "proxyCountryCode": "None",
                 },
@@ -513,6 +511,7 @@ def from_tiktok(cfg, existing_links, existing_names):
             row.update({
                 "name": name,
                 "category": "TikTok — профиль" + (" ✓" if verified else ""),
+                "_source": "tiktok",
                 "links": link,
                 "subscribers": follower_count,
                 "positioning": bio[:300] if bio else f"TikTok @{username}",
@@ -558,13 +557,13 @@ def from_youtube(cfg, existing_links, existing_names):
         return []
 
     found = []
-    for query in queries[:5]:
+    for query in queries[:10]:  # YouTube: 10 запросов
         print(f"  [YouTube] \"{query[:50]}\"", end="", flush=True)
         try:
             resp = requests.get(
                 "https://youtube.googleapis.com/youtube/v3/search",
                 params={"part": "snippet", "q": query, "type": "channel",
-                        "maxResults": 8, "relevanceLanguage": "ru", "key": YT_KEY},
+                        "maxResults": 25, "relevanceLanguage": "ru", "key": YT_KEY},
                 timeout=15,
             )
             if resp.status_code != 200:
@@ -721,6 +720,7 @@ def from_youtube(cfg, existing_links, existing_names):
                 row.update({
                     "name": title,
                     "category": "YouTube — канал",
+                    "_source": "youtube",
                     "links": c_url,
                     "subscribers": subs,
                     "positioning": desc[:300] if desc else "YouTube-канал",
@@ -776,12 +776,12 @@ def from_vk(cfg, existing_links, existing_names):
         return []
 
     found = []
-    for query in queries[:4]:
+    for query in queries[:10]:  # VK: 10 запросов
         print(f"  [VK] \"{query[:50]}\"", end="", flush=True)
         try:
             resp = requests.get(
                 "https://api.vk.com/method/newsfeed.search",
-                params={"q": query, "count": 15, "extended": 1,
+                params={"q": query, "count": 20, "extended": 1,
                         "access_token": VK_KEY, "v": "5.199"},
                 timeout=15,
             )
@@ -980,6 +980,7 @@ def from_vk(cfg, existing_links, existing_names):
                 row.update({
                     "name": name,
                     "category": "VK — сообщество" + (" ✓" if verified else ""),
+                    "_source": "vk",
                     "links": url,
                     "subscribers": followers,
                     "positioning": positioning[:300],
@@ -1026,12 +1027,12 @@ def from_brave(cfg, existing_links, existing_names):
         return []
 
     found = []
-    for query in queries[:6]:  # ограничиваем — сайты второй план
+    for query in queries[:10]:  # Brave: 10 запросов
         print(f"  [Brave] \"{query[:60]}\"", end="", flush=True)
         try:
             resp = requests.get(
                 "https://api.search.brave.com/res/v1/web/search",
-                params={"q": query, "count": 8, "country": "RU", "search_lang": "ru"},
+                params={"q": query, "count": 10, "country": "RU", "search_lang": "ru"},
                 headers={"Accept": "application/json", "Accept-Encoding": "gzip",
                          "X-Subscription-Token": BRAVE_API_KEY},
                 timeout=15,
@@ -1169,6 +1170,7 @@ def from_brave(cfg, existing_links, existing_names):
                 row.update({
                     "name": title,
                     "category": classify_source(domain, "Сайт"),
+                    "_source": "brave",
                     "links": link,
                     "subscribers": 0,
                     "positioning": desc[:300] if desc else "—",
@@ -1302,6 +1304,36 @@ def main():
         print(f"\n{'='*60}")
         print(f"  ПОСЛЕ ВАЛИДАЦИИ: {len(total_unique)} релевантных (отсеяно {len(rejected_all)})")
         print(f"{'='*60}")
+        # 🎯 КВОТА ПО ИСТОЧНИКАМ: YouTube ≥ 10, Instagram ≥ 5, TikTok ≥ 5
+        print("  📦 Проверка квот по источникам...")
+        for src_key in ("youtube", "instagram", "tiktok"):
+            cnt = sum(1 for r in total_unique if r.get("_source") == src_key)
+            print(f"     {src_key}: {cnt}")
+        MIN_SOURCE_QUOTA = {"youtube": 10, "instagram": 5, "tiktok": 5}
+        for src, min_cnt in MIN_SOURCE_QUOTA.items():
+            current = sum(1 for r in total_unique if r.get("_source") == src)
+            if current < min_cnt:
+                needed = min_cnt - current
+                from_src = [r for r in rejected_all if r.get("_source") == src]
+                from_src.sort(key=lambda x: x.get("subscribers", 0) or 0, reverse=True)
+                rescued = from_src[:needed]
+                total_unique.extend(rescued)
+                print(f"  📦 Квота {src}: добрано {len(rescued)} из отсеянных (стало {current + len(rescued)})")
+        total_unique = dedup(total_unique)
+        print(f"  Итого после квот: {len(total_unique)}")
+        # 🎯 КВОТА ПО ИСТОЧНИКАМ: YouTube ≥ 10, Instagram ≥ 5, TikTok ≥ 5
+        MIN_SOURCE_QUOTA = {"youtube": 10, "instagram": 5, "tiktok": 5}
+        for src, min_cnt in MIN_SOURCE_QUOTA.items():
+            current = sum(1 for r in total_unique if r.get("_source") == src)
+            if current < min_cnt:
+                needed = min_cnt - current
+                from_src = [r for r in rejected_all if r.get("_source") == src]
+                from_src.sort(key=lambda x: x.get("subscribers", 0) or 0, reverse=True)
+                rescued = from_src[:needed]
+                total_unique.extend(rescued)
+                print(f"  📦 Квота {src}: добрано {len(rescued)} из отсеянных (стало {current + len(rescued)})")
+        total_unique = dedup(total_unique)
+        print(f"  Итого после квот: {len(total_unique)}")
         if rejected_all:
             print(f"  Отсеяны: {', '.join(r['name'][:40] for r in rejected_all[:10])}")
         step += 1

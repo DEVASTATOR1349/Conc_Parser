@@ -119,3 +119,4 @@ sources:
 
 ## Лимиты
 max_total: 50
+max_total: 100
