@@ -1,190 +1,198 @@
 #!/usr/bin/env python3
 """
-analyze_competitors.py — AI-анализ конкурентов через OpenRouter (Gemini 2.0 Flash).
-Полностью самодостаточный, не зависит от apify-parser.
+analyze_competitors.py — AI-обогащение конкурентов через OpenRouter.
+Заполняет пустые поля: УТП, услуги, цена, слабые стороны, ToV, ЦА,
+активность, что заимствовать, валидация.
 
-Читает непроанализированные строки из Google Sheets,
-прогоняет через LLM и заполняет: ToV, угрозу, выводы, рекомендации.
+Модели: deepseek/deepseek-v4-flash (основная), google/gemini-2.5-flash (запасная).
 
 Запуск:
   export OPENROUTER_API_KEY=...
+  export SHEET_ID=...
   python3 analyze_competitors.py
+
+Или через обёртку run_enrich_kristina.py — она сама загрузит .env.
 """
 
-import json
-import os
-import re
-import sys
-import time
+import json, os, re, sys, time, traceback
 from datetime import datetime
+from pathlib import Path
 
 import requests
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
-from sheets import get_service, get_existing, update_cells
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+from sheets import get_service, update_cells
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-SHEET_ID = os.getenv("SHEET_ID", "1zVNwBX7e8FIZ-0bP7qU2UTbueXrukoev0NbSCS9EwHQ")
-SHEET_TAB = os.getenv("SHEET_TAB", "Отчёт по конкурентам")
+# ─── Конфиг ───
+OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+SHEET_ID = os.environ.get("SHEET_ID", "")
+SHEET_TAB = os.environ.get("SHEET_TAB", "Отчёт по конкурентам")
 
-MODEL = "google/gemini-2.5-flash"
-FALLBACK_MODEL = "deepseek/deepseek-v4-flash"
+MODEL_PRIMARY = "deepseek/deepseek-v4-flash"
+MODEL_FALLBACK = "google/gemini-2.5-flash"
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
+# Поля для заполнения (все 9 которые просил Олег)
+FIELDS_TO_FILL = {
+    "positioning":  "E",  # УТП
+    "services":     "F",  # Услуги
+    "price":        "G",  # Ценовой сегмент
+    "weaknesses":   "I",  # Слабые стороны
+    "tov":          "J",  # ToV
+    "audience":     "K",  # ЦА
+    "activity":     "L",  # Активность
+    "borrow":       "O",  # Что позаимствовать
+    "validation":   "Q",  # Валидация
+}
 
-def _ai_request(payload, max_tries=2):
-    """OpenRouter request with automatic fallback to FALLBACK_MODEL."""
-    models_to_try = [payload.get("model", MODEL), FALLBACK_MODEL]
-    for attempt in range(max_tries):
-        model = models_to_try[attempt] if attempt < len(models_to_try) else models_to_try[-1]
-        payload["model"] = model
+# Поля, которые не заполняются через AI (заполнены из парсинга)
+# D=подписчики, H=сильные(заполнены), N=угроза(заполнена), C=ссылки, A=название, B=категория, R=описание, M=форматы(заполнены), P=выводы
+
+
+def _ai_req(payload, retries=2):
+    """OpenRouter с fallback моделью."""
+    for attempt in range(retries):
+        model = payload.get("model", MODEL_PRIMARY)
+        if attempt > 0:
+            model = MODEL_FALLBACK
+            payload["model"] = model
+
         headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Authorization": f"Bearer {OPENROUTER_KEY}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/DEVASTATOR1349/Conc_Parser",
+            "HTTP-Referer": "https://github.com/DEVASTATOR1349/mark1",
         }
         try:
-            resp = requests.post(API_URL, json=payload, headers=headers, timeout=120)
+            resp = requests.post(API_URL, json=payload, headers=headers, timeout=90)
             if resp.status_code == 200:
                 return resp
-            if resp.status_code in (400, 404):
+            if resp.status_code in (400, 429, 503):
                 msg = resp.json().get("error", {}).get("message", "")
-                print(f"  [AI] {model}: {resp.status_code} ({msg[:60]}) -> fallback...", end=" ", flush=True)
+                print(f" [AI:{resp.status_code}] {model}: {msg[:40]}", end=" → ", flush=True)
                 continue
-            print(f"  [AI] {model}: {resp.status_code}")
+            print(f" [AI:{resp.status_code}] {model}", end=" → ", flush=True)
             return None
-        except requests.exceptions.Timeout:
-            print(f"  [AI] {model}: timeout -> fallback...", end=" ", flush=True)
+        except requests.Timeout:
+            print(f" [AI] timeout {model}", end=" → ", flush=True)
             continue
         except Exception as e:
-            print(f"  [AI] {model}: {e} -> fallback...", end=" ", flush=True)
+            print(f" [AI] err {model}: {e}", end=" → ", flush=True)
             continue
     return None
 
 
+def _empty(val):
+    v = str(val).strip()
+    return not v or v in ("—", "-", "0", "", "YES", "NO")
+
+
 def get_unanalyzed():
-    """Читаем строки с пустыми ключевыми полями аналитики."""
-    service = get_service()
-    if not service:
+    """Все строки с пустыми полями для обогащения."""
+    svc = get_service()
+    if not svc:
+        print("  ❌ Нет credentials (get_service вернул None)")
         return []
 
     try:
-        result = service.spreadsheets().values().get(
-            spreadsheetId=SHEET_ID,
-            range=f"{SHEET_TAB}!A:R"
+        result = svc.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range=f"{SHEET_TAB}!A:R"
         ).execute()
         values = result.get("values", [])
 
-        col_map = {
-            "name": 0, "category": 1, "links": 2, "subscribers": 3,
-            "positioning": 4, "services": 5, "price_segment": 6,
-            "strengths": 7, "weaknesses": 8, "tov": 9, "audience": 10,
-            "activity": 11, "formats": 12, "threat_level": 13,
-            "borrow": 14, "conclusion": 15, "validation": 16, "description": 17,
-        }
-
-        def empty(val):
-            v = str(val).strip()
-            return not v or v in ("—", "-", "0", "")
-
         rows = []
         for i, row in enumerate(values[1:], start=2):
-            row = row + [""] * (18 - len(row))
-            rd = {"row_index": i}
-            for key, col in col_map.items():
-                rd[key] = row[col] if col < len(row) else ""
+            row = row + [""] * max(0, 18 - len(row))
 
-            # Проверяем ключевые поля: услуги, цена, слабые, ToV, ЦА, заимств, вердикт
-            key_fields = [
-                rd.get("services", ""),
-                rd.get("price_segment", ""),
-                rd.get("weaknesses", ""),
-                rd.get("tov", ""),
-                rd.get("audience", ""),
-                rd.get("borrow", ""),
-                rd.get("conclusion", ""),
-            ]
-            missing_count = sum(1 for f in key_fields if empty(f))
-            # Также проверяем: validation = просто YES/NO (без обоснования)
-            val = str(rd.get("validation", "")).strip()
-            short_val = val in ("YES", "NO", "—", "-", "")
-            # Триггерим если: любое пустое поле ИЛИ короткая валидация
-            if missing_count >= 1 or short_val:
-                rows.append(rd)
+            # Определяем какие поля пустые
+            empty_fields = []
+            for fname, fcol in FIELDS_TO_FILL.items():
+                col_idx = ord(fcol) - ord("A")
+                val = row[col_idx] if col_idx < len(row) else ""
+                if _empty(val):
+                    empty_fields.append(fname)
+
+            if not empty_fields:
+                continue  # всё заполнено
+
+            rows.append({
+                "row_index": i,
+                "name":        row[0].strip() if len(row) > 0 else "",
+                "category":    row[1].strip() if len(row) > 1 else "",
+                "links":       row[2].strip() if len(row) > 2 else "",
+                "subscribers": row[3].strip() if len(row) > 3 else "",
+                "positioning": row[4].strip() if len(row) > 4 else "",
+                "services":    row[5].strip() if len(row) > 5 else "",
+                "price":       row[6].strip() if len(row) > 6 else "",
+                "strengths":   row[7].strip() if len(row) > 7 else "",
+                "formats":     row[12].strip() if len(row) > 12 else "",
+                "threat":      row[13].strip() if len(row) > 13 else "",
+                "sources":     row[17].strip() if len(row) > 17 else "",
+                "empty_fields": empty_fields,
+            })
 
         return rows
     except Exception as e:
-        print(f"  [analyze] Ошибка чтения: {e}")
+        print(f"  [get_unanalyzed] Ошибка: {e}")
         return []
 
-def ai_analyze(name, links, positioning, services):
-    """Прогнать конкурента через LLM."""
 
-    prompt = f"""Ты — аналитик конкурентов в косметологии и эстетической медицине. Твоя задача — проанализировать конкурента клиники НОМОС (Москва, косметология/пластическая хирургия/трихология) и заполнить ВСЕ поля.
+def ai_analyze(row):
+    """Прогнать конкурента через LLM — заполнить пустые поля."""
+    name = row["name"]
+    source = row["sources"] or name
+    links = row["links"] or "—"
+    subs = row["subscribers"] or "?"
+    category = row["category"] or "?"
+    existing_pos = row.get("positioning", "")
+    existing_serv = row.get("services", "")
+    existing_price = row.get("price", "")
 
-ДАННЫЕ:
+    # Определяем какие поля нужно заполнить
+    need = row["empty_fields"]
+    need_str = ", ".join(need)
+
+    prompt = f"""Ты — аналитик конкурентов в сфере здоровья, красоты, эстетической медицины и нутрициологии.
+Твоя задача — проанализировать конкурента и заполнить ТОЛЬКО те поля, которые пустые.
+
+ДАННЫЕ О КОНКУРЕНТЕ:
 - Название: {name}
+- Категория: {category}
 - Ссылки: {links}
-- Описание: {positioning}
-- Услуги (если известны): {services}
+- Подписчики: {subs}
+- Описание источника: {source}
+- Есть поля: УТП={'✅' if existing_pos else '❌'} | Услуги={'✅' if existing_serv else '❌'} | Цена={'✅' if existing_price else '❌'}
 
-Заполни строго JSON со ВСЕМИ полями:
+НУЖНО ЗАПОЛНИТЬ ({need_str}):
 
-1. **services_specialization** (строка) — перечисли услуги через запятую: инъекции, лазер, нити, пластика, трихология, эпиляция, anti-age, акне, дерматология, омоложение, контурная пластика, биоревитализация, пилинги, чистки, массаж лица и т.д. Если данных мало — предположи по названию.
+Заполни ТОЛЬКО пустые поля. Для каждого поля — 1-2 предложения.
+Оценивай по названию и категории. Если это VK-паблик с рецептами — не выдумывай услуги, оцени как инфоресурс.
 
-2. **positioning_utp** (строка) — позиционирование и УТП (1-2 предложения): премиум/доступный/семейный/экспертный/узкий. В чём фишка.
+Формат JSON:
+{{{{
+  "services_specialization": "..." | "",      # услуги/специализация
+  "positioning_utp": "..." | "",              # УТП и позиционирование
+  "price_segment": "..." | "",                # ценовой сегмент с примерными ценами или "неприменимо (инфоресурс)"
+  "weaknesses": ["...", "...", "..."] | [],   # 3 слабые стороны
+  "tov_style": "..." | "",                    # ToV: экспертный/ламповый/агрессивный/молодёжный и т.п.
+  "target_audience": "..." | "",              # ЦА: пол, возраст, боли
+  "activity_frequency": "..." | "",           # частота публикаций
+  "borrow": "..." | "",                       # что можно позаимствовать (3-5 идей)
+  "validation": "..." | "",                   # валидация: "YES — ..." или "NO — ..." с обоснованием
+}}}}
 
-3. **price_segment** (строка) — ценовой сегмент с примерными ценами в рублях. ОБЯЗАТЕЛЬНО укажи примерные цены в скобках, например: "средний+ (инъекции 5000-15000 руб, лазер 3000-8000 руб)" или "премиум (консультация от 3000 руб, процедуры от 15000 руб)". Обоснуй в 1 предложении. Если не клиника — напиши: "неприменимо (информационный ресурс)".
+Верни ТОЛЬКО JSON без markdown, без объяснений.
+Если данных недостаточно — пиши "—" (длинное тире)."""
 
-4. **tov_style** (строка) — тон общения: ламповый / агрессивный / экспертный / молодёжный / академичный / смешанный. 1-2 предложения с примерами.
-
-5. **target_audience** (строка) — ЦА: пол, возраст, доход, боли, интересы. 2-3 предложения.
-
-6. **threat_level** (число 1-10) — угроза для НОМОС (10 = прямой конкурент в Москве в том же сегменте).
-
-7. **borrow** (строка) — 3-5 конкретных идей что позаимствовать: рубрики, форматы, фишки, УТП, приёмы.
-
-8. **weaknesses** (массив из 3 строк) — 3 слабые стороны/точки роста.
-
-9. **strengths_enhanced** (строка) — 2-3 сильные стороны.
-
-10. **activity_frequency** (строка) — частота постинга: ежедневно / 2-3 в неделю / еженедельно / редко / неизвестно.
-
-11. **content_formats** (строка) — форматы: Reels/Stories/посты/лайвы/экспертные статьи/до-после/отзывы/обзоры процедур/лайфстайл/образовательный.
-
-12. **conclusion** (строка) — вердикт (3-4 предложения): чем опасен для НОМОС, что умеет, как обходить, в чём мы сильнее.
-
-13. **validation** (строка) — ОБЯЗАТЕЛЬНО развёрнутое предложение. Формат: "YES — клиника в Москве, оказывает инъекционные и лазерные услуги, есть адрес и запись" или "NO — это информационный портал/блог без собственной клиники, только статьи и реклама". Дай 1-2 предложения обоснования. Будь строг: если нет адреса/клиники — NO.
-
-Верни ТОЛЬКО валидный JSON без markdown-обрамления:
-{{
-  "services_specialization": "...",
-  "positioning_utp": "...",
-  "price_segment": "...",
-  "tov_style": "...",
-  "target_audience": "...",
-  "threat_level": 5,
-  "borrow": "...",
-  "weaknesses": ["...", "...", "..."],
-  "strengths_enhanced": "...",
-  "activity_frequency": "...",
-  "content_formats": "...",
-  "conclusion": "...",
-  "validation": "..."
-}}"""
-
-    
     payload = {
-        "model": MODEL,
+        "model": MODEL_PRIMARY,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.7,
-        "max_tokens": 1000,
+        "temperature": 0.5,
+        "max_tokens": 1500,
     }
 
     try:
-        resp = _ai_request(payload)
+        resp = _ai_req(payload)
         if resp is None:
-            print("  [AI] все модели недоступны")
             return None
 
         content = resp.json()["choices"][0]["message"]["content"]
@@ -193,107 +201,139 @@ def ai_analyze(name, links, positioning, services):
             content = json_match.group(1)
         return json.loads(content.strip())
     except Exception as e:
-        print(f"  [AI] error: {e}")
+        print(f" [AI] парсинг ответа: {e}", flush=True)
         return None
 
 
-def update_row(service, ai_result, row_index):
-    """Обновить строку в Google Sheets."""
-    if not ai_result:
+def update_row(svc, result, row_index):
+    """Записать только непустые поля результата."""
+    if not result:
         return False
 
-    # ВСЕ КОЛОНКИ: E=позиционирование, F=услуги, G=ценовой, H=сильные, I=слабые, J=ToV, K=ЦА, L=активность, M=форматы, N=угроза, O=заимств, P=вердикт, Q=валидация
     updates = {}
-    if ai_result.get("positioning_utp"):
-        updates["E"] = ai_result["positioning_utp"]
-    if ai_result.get("services_specialization"):
-        updates["F"] = ai_result["services_specialization"]
-    if ai_result.get("price_segment"):
-        updates["G"] = ai_result["price_segment"]
-    if ai_result.get("strengths_enhanced"):
-        updates["H"] = ai_result["strengths_enhanced"]
-    if ai_result.get("weaknesses"):
-        updates["I"] = "\n".join(ai_result["weaknesses"]) if isinstance(ai_result["weaknesses"], list) else str(ai_result["weaknesses"])
-    if ai_result.get("tov_style"):
-        updates["J"] = ai_result["tov_style"]
-    if ai_result.get("target_audience"):
-        updates["K"] = ai_result["target_audience"]
-    if ai_result.get("activity_frequency"):
-        updates["L"] = ai_result["activity_frequency"]
-    if ai_result.get("content_formats"):
-        updates["M"] = ai_result["content_formats"]
-    if ai_result.get("threat_level"):
-        updates["N"] = str(ai_result["threat_level"])
-    if ai_result.get("borrow"):
-        updates["O"] = ai_result["borrow"]
-    if ai_result.get("conclusion"):
-        updates["P"] = ai_result["conclusion"]
-    if ai_result.get("is_clinic"):
-        updates["Q"] = ai_result["is_clinic"]
+    F = FIELDS_TO_FILL  # { fname -> col }
+    mapping = {
+        "services_specialization": ("F", "services"),
+        "positioning_utp":         ("E", "positioning"),
+        "price_segment":           ("G", "price"),
+        "weaknesses":              ("I", "weaknesses"),
+        "tov_style":               ("J", "tov"),
+        "target_audience":         ("K", "audience"),
+        "activity_frequency":      ("L", "activity"),
+        "borrow":                  ("O", "borrow"),
+        "validation":              ("Q", "validation"),
+    }
 
-    if ai_result.get("validation"):
-        updates["Q"] = ai_result["validation"]
+    for res_key, (col, fname) in mapping.items():
+        val = result.get(res_key)
+        if not val:
+            continue
+        val_str = str(val).strip()
+        if not val_str or val_str in ("[]", ""):
+            continue
+        if isinstance(val, list):
+            val_str = "\n".join(str(x) for x in val if x)
 
-    return update_cells(SHEET_ID, SHEET_TAB, row_index, updates)
+        updates[col] = val_str
+
+    if not updates:
+        return True  # ничего не изменилось — это норм
+
+    ok = update_cells(SHEET_ID, SHEET_TAB, row_index, updates)
+    return ok
 
 
 def main():
     print("=" * 60)
-    print(f"  AI-АНАЛИЗ КОНКУРЕНТОВ")
+    print(f"  AI-ОБОГАЩЕНИЕ КОНКУРЕНТОВ")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"  Модель: {MODEL_PRIMARY} → {MODEL_FALLBACK}")
     print("=" * 60)
 
-    if not OPENROUTER_API_KEY:
+    if not OPENROUTER_KEY:
         print("\n  ❌ Нет OPENROUTER_API_KEY")
         return
 
-    print("\n1. Чтение непроанализированных строк...")
-    rows = get_unanalyzed()
-    print(f"   Найдено: {len(rows)}")
-
-    if not rows:
-        print("\n  ✅ Все конкуренты уже проанализированы!")
+    if not SHEET_ID:
+        print("\n  ❌ Нет SHEET_ID (передай через env)")
         return
 
-    # Ограничиваем batch
-    batch = rows[:100]
-    print(f"\n2. Анализ {len(batch)} конкурентов через AI...\n")
+    print(f"\n  Таблица: {SHEET_ID}")
+    print(f"  Вкладка: {SHEET_TAB}", flush=True)
 
-    service = None
-    try:
-        service = get_service()
-    except Exception:
-        pass
+    rows = get_unanalyzed()
+    if not rows:
+        print("\n  ✅ Все строки уже обогащены!")
+        return
+
+    print(f"  Строк для обогащения: {len(rows)}")
+    print(f"  Пустые поля в каждой: {len(rows[0]['empty_fields'])}...\n", flush=True)
+
+    svc = get_service()
+    if not svc:
+        print("  ❌ Не удалось получить Google Sheets сервис")
+        return
 
     success = 0
-    for i, row in enumerate(batch, 1):
-        name = row.get("name", "?")
-        print(f"   [{i}/{len(batch)}] {name[:40]}", end="", flush=True)
+    fail = 0
+    skipped = 0
+    start_time = time.time()
+    total = len(rows)
 
-        ai = ai_analyze(
-            name=name,
-            links=row.get("links", ""),
-            positioning=row.get("positioning", ""),
-            services=row.get("services", ""),
-        )
+    for idx, row in enumerate(rows, 1):
+        elapsed = time.time() - start_time
+        rate = idx / elapsed if elapsed > 0 else 0
+        eta = (total - idx) / rate if rate > 0 else 0
 
-        if ai:
-            if service:
-                ok = update_row(service, ai, row["row_index"])
+        name = row["name"][:35]
+        empty = row["empty_fields"]
+        print(f"  [{idx}/{total}] {name:35s} пусто:{len(empty)}",
+              end="", flush=True)
+
+        result = ai_analyze(row)
+
+        if result:
+            ok = update_row(svc, result, row["row_index"])
+            if ok:
+                success += 1
+                fill_count = sum(1 for k in result if result.get(k))
+                print(f" ✅ +{fill_count} полей", flush=True)
+            else:
+                fail += 1
+                print(f" ❌ запись", flush=True)
+        else:
+            # Пробуем ещё раз
+            time.sleep(2)
+            result = ai_analyze(row)
+            if result:
+                ok = update_row(svc, result, row["row_index"])
                 if ok:
                     success += 1
-                    tl = ai.get("threat_level", "?")
-                    print(f" ✅ угроза={tl}")
+                    fill_count = sum(1 for k in result if result.get(k))
+                    print(f" ✅ (retry) +{fill_count} полей", flush=True)
                 else:
-                    print(f" ❌ запись не удалась")
+                    fail += 1
+                    print(f" ❌ (retry)", flush=True)
             else:
-                success += 1
-                tl = ai.get("threat_level", "?")
-                print(f" ✅ угроза={tl} (dry-run)")
-        else:
-            print(f" ❌ AI не ответил")
+                fail += 1
+                print(f" ❌ AI недоступен", flush=True)
 
-    print(f"\n  Проанализировано: {success}/{len(batch)}")
+        # Сброс каждые 25 строк для стабильности
+        if idx % 25 == 0:
+            elapsed = time.time() - start_time
+            remaining = total - idx
+            rate = idx / elapsed if elapsed > 0 else 0
+            eta_s = remaining / rate if rate > 0 else 0
+            print(f"  ─── Прогресс: {idx}/{total}, +{(success/(idx or 1)*100):.0f}% | "
+                  f"E:{elapsed/60:.1f}мин / ост:{eta_s/60:.1f}мин", flush=True)
+            time.sleep(0.5)
+
+    elapsed = time.time() - start_time
+    print(f"\n{'='*60}")
+    print(f"  🎉 ЗАВЕРШЕНО!")
+    print(f"  ✅ Успешно: {success}/{total}")
+    print(f"  ❌ Ошибок: {fail}/{total}")
+    print(f"  ⏱ {elapsed/60:.1f} мин ({elapsed/total:.1f} сек/строка)")
     print("=" * 60)
 
 
