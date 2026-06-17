@@ -1,68 +1,150 @@
-# Марк1 — Парсер конкурентов косметологии
+# Марк 1 — Конкурентный анализ и обогащение
 
-Полностью самодостаточный сервис для сбора и анализа конкурентов-клиник косметологии в Москве.
+**Автоматизированный пайплайн сбора и AI-обогащения конкурентов для клиентов (клиники, нутрициологи, косметология).**
 
-## Возможности
+## Архитектура
 
-- **Brave Search API** — поиск клиник по ключевым запросам (сайты, отзывы)
-- **YouTube Data API** — поиск каналов клиник/косметологов
-- **Apify Instagram Scraper** — поиск Instagram-профилей
-- **Google Sheets** — запись результатов (опционально)
-- **HTTP-сервер** — для n8n или внешних вызовов
-- **Docker** — изолированный контейнер
+```
+┌─────────────────┐     ┌─────────────────┐     ┌────────────────┐
+│   Источники      │     │   Парсер         │     │   Обогащение    │
+│  ┌───────────┐   │     │                   │     │   (DeepSeek V4  │
+│  │ Brave Search│  │     │ search_competitors│    │    Flash)        │
+│  ├───────────┤   │     │       .py         │     │                  │
+│  │ VK API     │  │ ──→ │                   │ ──→ │ analyze_        │
+│  ├───────────┤   │     │ 9 источников      │     │ competitors.py  │
+│  │ Apify      │  │     │ (Brave, VK, Apify, │    │                  │
+│  │ (Inst/TT)  │  │     │  YouTube по Brave)│     │ 9 полей через AI │
+│  ├───────────┤   │     └────────┬──────────┘     └────────┬───────┘
+│  │ YouTube*  │  │              │                          │
+│  └───────────┘   │              ▼                          ▼
+└─────────────────┘     ┌───────────────────────────────────────┐
+            │            │         Google Sheets (A:R)            │
+            │            │  555+ конкурентов с enrich-полями     │
+            │            └───────────────────────────────────────┘
+            │
+         *YouTube Data API заблокирован на VPS → обход через Brave Search
+```
 
 ## Быстрый старт
 
 ```bash
-# 1. Скопировать .env
+# 1. Клонировать
+git clone git@github.com:DEVASTATOR1349/Conc_Parser.git
+cd Conc_Parser
+
+# 2. Настроить .env
 cp .env.example .env
-# Заполнить ключи (хотя бы BRAVE_API_KEY)
+# Заполнить: OPENROUTER_API_KEY, BRAVE_API_KEY, VK_API_KEY,
+# APIFY_API_TOKEN, GOOGLE_APPLICATION_CREDENTIALS
 
-# 2. Запустить поиск
-docker compose run --rm mark1 python3 /app/search_competitors.py
-
-# 3. Или HTTP-сервер для n8n
+# 3. Поднять контейнер (API на порту 18888)
 docker compose up -d
+
+# 4. Ручной парсинг
+python3 search_competitors.py --client kristina_kuznetsova
+
+# 5. Обогащение для Кристины
+python3 run_enrich_kristina.py
+
+# 6. Обогащение для НОМОС
+SHEET_ID="1zVNwBX7e8FIZ-0bP7qU2UTbueXrukoev0NbSCS9EwHQ" \
+  python3 analyze_competitors.py
 ```
 
-## Переменные окружения
+## Клиенты
 
-| Переменная | Для чего | Обязательно |
-|---|---|---|
-| `BRAVE_API_KEY` | Brave Search (2000 запросов/мес, бесплатно) | Да (если без него — только YouTube) |
-| `YOUTUBE_API_KEY` | YouTube Data API | Нет |
-| `APIFY_API_TOKEN` | Instagram через Apify | Нет |
-| `OPENROUTER_API_KEY` | AI-анализ (ToV, выводы) | Нет |
-| `GOOGLE_CREDENTIALS_JSON` | Google Sheets (JSON сервисного аккаунта) | Нет |
-| `SHEET_ID` | ID таблицы для записи | Нет (без неё — dry-run) |
+| Клиент | Таблица | Статус |
+|--------|---------|--------|
+| **НОМОС КЛИНИК** | `1zVNwBX7e8FIZ-0bP7qU2UTbueXrukoev0NbSCS9EwHQ` | ✅ 196 конкурентов |
+| **Кристина Кузнецова** | `1hIsSBIP0f7jXAFQZGhAj_0locMKUdb9JKmWM4kjfSLQ` | ✅ 555 конкурентов |
 
-## Команды
+## Сбор данных (search_competitors.py)
+
+Собирает конкурентов из **9+ источников** с фильтрацией по подписчикам (tier):
+
+- **Tier 1** (≥100K) — топ-конкуренты
+- **Tier 2** (≥50K) — средние
+- **Tier 3** (≥10K) — нишевые
+
+### Источники
+| Источник | Скорость | Данные |
+|----------|----------|--------|
+| **Brave Search** | ⚡ Быстро | Сайты, YouTube-каналы |
+| **VK API** | ⚡ Быстро | Сообщества, группы |
+| **Apify (Instagram)** | 🐢 Медленно | Instagram-профили |
+| **Apify (TikTok)** | 🐢 Медленно | TikTok-профили |
+| **YouTube** (через Brave) | ⚡ | Каналы |
+
+## Обогащение (analyze_competitors.py)
+
+AI-анализ через **DeepSeek V4 Flash** (основная) → **Gemini 2.5 Flash** (запасная) через OpenRouter.
+
+### Какие поля заполняет (9 полей):
+| Колонка | Поле | Описание |
+|---------|------|----------|
+| **E** | Позиционирование / УТП | УТП и позиционирование конкурента |
+| **F** | Услуги / специализация | Перечень услуг |
+| **G** | Ценовой сегмент | С примерными ценами |
+| **I** | Слабые стороны / точки роста | 3 слабые стороны |
+| **J** | ToV и стиль контента | Тон общения |
+| **K** | ЦА (основной сегмент) | Пол, возраст, боли |
+| **L** | Активность / частота | Частота постинга |
+| **O** | Что можно позаимствовать | 3-5 конкретных идей |
+| **Q** | Валидация | YES/NO с обоснованием |
+
+## Файлы
+
+| Файл | Назначение |
+|------|------------|
+| `analyze_competitors.py` | **Основной скрипт обогащения** (DeepSeek V4 Flash) |
+| `search_competitors.py` | **Парсер конкурентов** (все источники) |
+| `run_enrich_kristina.py` | **Обёртка обогащения Кристины** (хардкод ID) |
+| `kristina_final_fill.py` | **Добор конкурентов** VK + Brave до 555 |
+| `src/sheets.py` | Работа с Google Sheets |
+| `src/fact_check.py` | Факт-чекинг конкурентов |
+| `src/validate_batch.py` | Батч-валидация |
+| `clients/*.md` | Конфиги запросов по клиенту |
+| `api_server.py` | HTTP API (Flask) на порту 8888 |
+| `docker-compose.yml` | Docker-сборка контейнера |
+
+## API (порт 18888)
 
 ```bash
-# Поиск конкурентов
-docker compose run --rm mark1 python3 /app/search_competitors.py
+# Health check
+curl http://localhost:18888/health
 
-# AI-анализ (дозаполняет творческие поля)
-docker compose run --rm mark1 python3 /app/analyze_competitors.py
+# Список клиентов
+curl http://localhost:18888/api/clients
 
-# HTTP-сервер (порт 8888)
-docker compose up -d
-# POST /competitors/search
-# POST /competitors/analyze
-# GET  /competitors/status
-# GET  /health
+# Запустить парсинг для клиента
+curl -X POST http://localhost:18888/api/parse -d '{"client":"kristina_kuznetsova"}'
+
+# Запустить обогащение
+curl -X POST http://localhost:18888/api/enrich -d '{"sheet_id":"1hIs..."}'
 ```
 
-## API эндпоинты (HTTP-сервер)
+## Кроны
 
-```bash
-curl -X POST http://localhost:8888/competitors/search
-# → {"success": true, "total": 15, "report": "..."}
+Контейнер `mark1-parser` запущен и обслуживает API-запросы.
+Для автоматического парсинга добавить в crontab:
 
-curl -X POST http://localhost:8888/competitors/analyze
-# → {"success": true, "total": 10, "report": "..."}
+```cron
+# Ежедневно в 6:00 — парсить всех клиентов
+0 6 * * * cd /root/mark1 && docker exec mark1-parser python3 /app/search_competitors.py --all
 ```
 
-## Лицензия
+---
 
-MIT
+## Чейнджлог
+
+### v4.1 (17.06.2026)
+- ✅ DeepSeek V4 Flash — основная модель обогащения
+- ✅ Кристина: 555 конкурентов (417 сайтов, 120 VK, 11 Instagram, 7 TikTok)
+- ✅ НОМОС: 196 чистых строк (восстановлен из бекапа)
+- ✅ Заполняет все 9 полей: УТП, услуги, цена, слабые, ToV, ЦА, активность, заимствования, валидация
+- ✅ Контейнер mark1-parser пересобран и запущен
+- ✅ Защита от записи не в свою таблицу (хардкод ID в run_enrich)
+
+### v4.0 (раньше)
+- НОМОС очищен от мусора через AI-верификацию
+- Базовая архитектура парсинга
