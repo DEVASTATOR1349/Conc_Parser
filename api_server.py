@@ -171,6 +171,24 @@ async def list_clients():
     return {"clients": result}
 
 
+@app.post("/api/git/pull")
+async def git_pull():
+    """Запуллить изменения из GitHub (ветка mark1)."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(APP_DIR), "pull", "origin", "mark1"],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            return {"success": True, "output": result.stdout.strip(), "branch": "mark1"}
+        else:
+            return {"success": False, "error": result.stderr.strip() or result.stdout.strip()}
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "Git pull timeout (30s)"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 @app.get("/api/clients/{name}")
 async def get_client(name: str):
     path = CLIENTS_DIR / f"{name}.md"
