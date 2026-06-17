@@ -15,7 +15,7 @@ services:
       - .env
     environment:
       - TZ=Europe/Moscow
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/service_account.json
     volumes:
       - ./logs:/app/logs
-      # Если используешь файл сервисного аккаунта (не JSON-строкой)
-      # - ./service_account.json:/app/service_account.json:ro
+      - ./service_account.json:/app/service_account.json:ro
